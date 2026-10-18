@@ -22,5 +22,6 @@ The feed for the tvhome launcher's "Office dashboard" screensaver, on port **879
 | `GET /feed.json` | `?token=` read token |
 | `GET /photos/<id>.jpg` | none |
 | `POST /calendar` | `Authorization: Bearer <upload token>` |
+| `POST /revenue` | `Authorization: Bearer <upload token>`. Body `{"revenue": {today_cents, mrr_cents, mrr_label, ytd_cents, all_time_cents, updated_epoch, ...}, "new_payments": [{id, amount_cents, account, description, created_epoch}]}`. Once a push arrives, it replaces the Stripe numbers and pop-ups. The TV hides revenue more than 15 minutes old. |
 | `POST /provision` | signed payload |
 | `GET /health` | none (ages and counts only) |

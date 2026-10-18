@@ -8,7 +8,7 @@ services:
       APP_PORT: 8787
       # The status page (/) stays behind the umbrelOS login. These paths carry their own
       # token or signature checks, so TVs and the admin box can reach them directly.
-      PROXY_AUTH_WHITELIST: "/feed.json,/photos/*,/health,/calendar,/provision"
+      PROXY_AUTH_WHITELIST: "/feed.json,/photos/*,/health,/calendar,/revenue,/provision"
 
   feed:
     # Official multi-arch Python image (amd64 + arm64), pinned by digest. The app code is

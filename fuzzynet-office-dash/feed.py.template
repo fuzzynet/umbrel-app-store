@@ -488,6 +488,8 @@ def place_from_nominatim(addr):
     if addr.get("country_code") in ("us", "gb") and region:
         country, region = region, local
     parts = [p for p in (region, country) if p]
+    if len(parts) == 2 and parts[0] == parts[1]:
+        parts = parts[:1]
     return short_desc(", ".join(parts), 48)
 
 
@@ -643,13 +645,25 @@ def admin_page():
 
 
 # ---------------------------------------------------------------- HTTP
+def revenue_push():
+    """Revenue pushed by an admin-side collector (POST /revenue): billing-system totals and pop-ups.
+    Once a push has been received it replaces this feed's own Stripe numbers and Stripe pop-ups."""
+    p = os.path.join(DATA, "revenue_push.json")
+    try:
+        return json.load(open(p))
+    except (OSError, ValueError):
+        return None
+
+
 def build_feed():
+    pushed = revenue_push()
     with LOCK:
         photos = [{"url": "/photos/" + p["file"], "caption": p["caption"], "credit": p["credit"]}
                   for p in STATE["photos"]]
         return {"version": 1, "generated_epoch": int(now()), "timezone": "America/Phoenix",
-                "weather": STATE["weather"], "calendar": calendar_section(), "revenue": STATE["revenue"],
-                "new_payments": list(STATE["new_payments"]), "photos": photos}
+                "weather": STATE["weather"], "calendar": calendar_section(),
+                "revenue": pushed["revenue"] if pushed else STATE["revenue"],
+                "new_payments": list(pushed["new_payments"] if pushed else STATE["new_payments"]), "photos": photos}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -705,7 +719,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._send(400, {"error": "bad json"})
             return self._send(*apply_provision(body))
-        if path != "/calendar":
+        if path not in ("/calendar", "/revenue"):
             return self._send(404, {"error": "not found"})
         auth = self.headers.get("Authorization", "")
         if not self._token_ok("DASH_UPLOAD_TOKEN", auth[7:] if auth.startswith("Bearer ") else ""):
@@ -713,6 +727,23 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         if n <= 0 or n > 1_000_000:
             return self._send(400, {"error": "body size"})
+        if path == "/revenue":
+            try:
+                body = json.loads(self.rfile.read(n))
+                rev, pays = body["revenue"], body.get("new_payments") or []
+                for k_ in ("today_cents", "mrr_cents", "ytd_cents", "all_time_cents", "updated_epoch"):
+                    int(rev[k_])
+                clean = []
+                for x in pays[:20]:  # only the fields the TV shows; no customer names
+                    clean.append({"id": str(x["id"])[:80], "amount_cents": int(x["amount_cents"]),
+                                  "account": str(x.get("account", ""))[:20], "customer": "",
+                                  "description": short_desc(str(x.get("description", "")), 40),
+                                  "created_epoch": int(x.get("created_epoch", 0))})
+            except Exception as e:
+                return self._send(400, {"error": "bad revenue: %s" % type(e).__name__})
+            atomic_write(os.path.join(DATA, "revenue_push.json"),
+                         {"revenue": rev, "new_payments": clean, "_received_epoch": int(now())})
+            return self._send(200, {"ok": True, "new_payments": len(clean)})
         try:
             raw = json.loads(self.rfile.read(n))
             if isinstance(raw, list):
