@@ -4,13 +4,12 @@ name: Office Dashboard Feed
 tagline: Revenue, weather, calendar and photos for a TV screensaver
 icon: https://raw.githubusercontent.com/fuzzynet/umbrel-app-store/main/fuzzynet-office-dash/icon.svg
 category: finance
-version: "1.1.0"
+version: "1.2.0"
 port: 8790
 description: >-
   A small feed for the tvhome launcher's "Office dashboard" screensaver. It serves revenue (today,
   trailing 30 days or MRR, year to date and all-time) pushed by an admin machine from its billing
-  systems, or computed from read-only Stripe restricted keys,
-  Open-Meteo weather, an uploaded calendar for today, and rotating Wikimedia Commons landscape photos,
+  systems, Open-Meteo weather, an uploaded calendar for today, and rotating Wikimedia Commons landscape photos,
   and serves them as JSON for Android TV boxes on the local network.
 
 
@@ -25,9 +24,10 @@ repo: https://github.com/fuzzynet/umbrel-app-store
 support: https://github.com/fuzzynet/umbrel-app-store/issues
 gallery: []
 releaseNotes: >-
-  Revenue can now be pushed by an admin machine (POST /revenue, upload token) so totals can come from
-  billing systems the app cannot reach itself. Pushed totals and payment pop-ups replace the app's own
-  Stripe numbers. Photo captions no longer repeat the country.
+  Stripe polling is now off by default. Revenue and payment pop-ups come only from the totals an admin
+  machine pushes with POST /revenue. Stripe keys are no longer needed or provisioned (the old built-in
+  Stripe mode stays available only if DASH_STRIPE_ENABLED=1 is set). The status page no longer lists
+  Stripe keys.
 dependencies: []
 path: ""
 defaultUsername: ""

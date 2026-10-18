@@ -8,7 +8,8 @@ Stdlib only. Serves, on DASH_BIND:DASH_PORT (default 0.0.0.0:8787):
   GET  /health           Liveness + section ages (no numbers, no token).
 
 Environment (secrets are never printed or logged):
-  STRIPE_AZTC_READ_KEY, STRIPE_FUZZHOST_READ_KEY   restricted read-only Stripe keys
+  STRIPE_AZTC_READ_KEY, STRIPE_FUZZHOST_READ_KEY   restricted read-only Stripe keys (only used when
+                      DASH_STRIPE_ENABLED=1; revenue normally comes from POST /revenue)
   DASH_TOKEN          read token the TV sends
   DASH_UPLOAD_TOKEN   token for POST /calendar
   DASH_DATA           state dir (default ~/office-dash/data)
@@ -52,7 +53,7 @@ except Exception:  # images without tzdata; Phoenix has no DST
 DATA = os.path.expanduser(os.environ.get("DASH_DATA", "~/office-dash/data"))
 CONFIG_PATH = os.path.join(DATA, "config.json")
 CONFIG_KEYS = ("STRIPE_AZTC_READ_KEY", "STRIPE_FUZZHOST_READ_KEY", "DASH_TOKEN", "DASH_UPLOAD_TOKEN",
-               "DASH_MRR_SOURCE", "DASH_LAT", "DASH_LON")
+               "DASH_MRR_SOURCE", "DASH_LAT", "DASH_LON", "DASH_STRIPE_ENABLED")
 _CONFIG = {"values": {}, "mtime": None}
 
 
@@ -488,8 +489,6 @@ def place_from_nominatim(addr):
     if addr.get("country_code") in ("us", "gb") and region:
         country, region = region, local
     parts = [p for p in (region, country) if p]
-    if len(parts) == 2 and parts[0] == parts[1]:
-        parts = parts[:1]
     return short_desc(", ".join(parts), 48)
 
 
@@ -631,8 +630,11 @@ TVs read <code>/feed.json?token=...</code>.</p></body></html>"""
 
 def admin_page():
     rows = []
-    for k_ in ("STRIPE_AZTC_READ_KEY", "STRIPE_FUZZHOST_READ_KEY", "DASH_TOKEN", "DASH_UPLOAD_TOKEN"):
+    for k_ in ("DASH_TOKEN", "DASH_UPLOAD_TOKEN"):
         rows.append((k_, "set" if cfg(k_) else "missing"))
+    pushed = revenue_push()
+    rows.append(("revenue source", "pushed (POST /revenue)" if pushed else
+                 ("Stripe" if cfg("DASH_STRIPE_ENABLED") == "1" else "none yet")))
     f = build_feed()
     for k_ in ("revenue", "weather", "calendar"):
         rows.append((k_ + " age", ("%d s" % (now() - f[k_]["updated_epoch"])) if f[k_] else "none"))
@@ -646,7 +648,7 @@ def admin_page():
 
 # ---------------------------------------------------------------- HTTP
 def revenue_push():
-    """Revenue pushed by an admin-side collector (POST /revenue): billing-system totals and pop-ups.
+    """Revenue pushed by the box collector (POST /revenue): WHMCS + Invoice Ninja totals and pop-ups.
     Once a push has been received it replaces this feed's own Stripe numbers and Stripe pop-ups."""
     p = os.path.join(DATA, "revenue_push.json")
     try:
@@ -758,7 +760,13 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     os.makedirs(DATA, exist_ok=True)
-    for fn in (stripe_loop, weather_loop, photo_loop):
+    loops = [weather_loop, photo_loop]
+    # Revenue normally arrives via POST /revenue. The built-in Stripe poller is off unless asked for.
+    if cfg("DASH_STRIPE_ENABLED") == "1":
+        loops.append(stripe_loop)
+    else:
+        log("Stripe polling off (set DASH_STRIPE_ENABLED=1 to use the built-in Stripe revenue)")
+    for fn in loops:
         threading.Thread(target=fn, daemon=True, name=fn.__name__).start()
     bind = os.environ.get("DASH_BIND", "0.0.0.0")
     port = int(os.environ.get("DASH_PORT", "8787"))

@@ -9,8 +9,8 @@ The feed for the tvhome launcher's "Office dashboard" screensaver, on port **879
 - Image: the official `python:3.13-alpine` (multi-arch), pinned by digest. The app code is `feed.py.template`.
   umbrelOS renders it to `feed.py` on install and on every update (the file has no `$`, so envsubst leaves it unchanged).
   The code uses only the Python standard library.
-- State lives in `${APP_DATA_DIR}/data`: the Stripe charge cache, the calendar, photos and `config.json` (mode 600).
-- Nothing secret is in this repository. Stripe keys and access tokens arrive after install through
+- State lives in `${APP_DATA_DIR}/data`: pushed revenue totals, the calendar, photos and `config.json` (mode 600).
+- Nothing secret is in this repository. Access tokens arrive after install through
   `POST /provision`. That request carries an RSA-signed payload, and only the admin box holds the signing key.
   `DASH_PROVISION_KEY` in the compose file is the public half.
 
@@ -22,6 +22,6 @@ The feed for the tvhome launcher's "Office dashboard" screensaver, on port **879
 | `GET /feed.json` | `?token=` read token |
 | `GET /photos/<id>.jpg` | none |
 | `POST /calendar` | `Authorization: Bearer <upload token>` |
-| `POST /revenue` | `Authorization: Bearer <upload token>`. Body `{"revenue": {today_cents, mrr_cents, mrr_label, ytd_cents, all_time_cents, updated_epoch, ...}, "new_payments": [{id, amount_cents, account, description, created_epoch}]}`. Once a push arrives, it replaces the Stripe numbers and pop-ups. The TV hides revenue more than 15 minutes old. |
+| `POST /revenue` | `Authorization: Bearer <upload token>`. Body `{"revenue": {today_cents, mrr_cents, mrr_label, ytd_cents, all_time_cents, updated_epoch, ...}, "new_payments": [{id, amount_cents, account, description, created_epoch}]}`. This is the only revenue source: the app does not poll any payment provider (a legacy Stripe mode runs only if `DASH_STRIPE_ENABLED=1`). The TV hides revenue more than 15 minutes old. |
 | `POST /provision` | signed payload |
 | `GET /health` | none (ages and counts only) |
