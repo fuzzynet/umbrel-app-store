@@ -1,0 +1,30 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      # <app-id>_<service>_1
+      APP_HOST: fuzzynet-office-dash_feed_1
+      APP_PORT: 8787
+      # The status page (/) stays behind the umbrelOS login. These paths carry their own
+      # token or signature checks, so TVs and the admin box can reach them directly.
+      PROXY_AUTH_WHITELIST: "/feed.json,/photos/*,/health,/calendar,/provision"
+
+  feed:
+    # Official multi-arch Python image (amd64 + arm64), pinned by digest. The app code is
+    # feed.py, rendered by umbrelOS from feed.py.template on install and on every update.
+    image: python:3.13-alpine@sha256:2d9aefe2fef018a7eb2c13064c89c71929800fd2e5dccdbf52ea5da5bb8d929a
+    user: "1000:1000"
+    init: true
+    restart: on-failure
+    command: ["python", "-u", "/app/feed.py"]
+    volumes:
+      - ${APP_DATA_DIR}/feed.py:/app/feed.py:ro
+      - ${APP_DATA_DIR}/data:/data
+    environment:
+      DASH_DATA: /data
+      DASH_PORT: "8787"
+      PYTHONDONTWRITEBYTECODE: "1"
+      # Public half of the admin box's provisioning key. Only payloads signed with the
+      # matching private key are accepted by POST /provision. Not a secret.
+      DASH_PROVISION_KEY: "rsa:65537:8ef7bae28078c6bbbfaaa09b7fb54f8549d1922c1f0cee8ca346f29c3a9b1f0b79e8d1a13599e615968d6f6578ad720cb362d31480ca718bae4c167a65de9fd909f3211b78bd478ff47ef3dae3c569c783052ccbf2de6e725303ba43d9cf9ff018ce14b6c083384168570e565dfdb40904ad4fd7c342ea6ffed7d5254c199dee68765b1634abd4c81b31167eca275cc11810421443d39e8f16b0d5e89cce19c6c787ae64c18d09d9d7e8a8425abbb1122877a3876de8c57dad7db6b11f5c271d2099c3e51ddcb375841aabad75dfda63a910ec0b10ff3a5826ce0f0f2883bb67775294e4e0f029074b0bb5411080ce306b3453a6555a8c64345a4eb566c6b80ea4343360dfaaa56a6571dc4f4a7e1bc94a8f46b6d6b8f8bf2e40ca2513315c3c8927f3bc6cce2cfcbfd8d74f948e320705d4744365756a5e4babd1a8c498e476978584869558c4c79978d8067b7a0ad7e84e02e804c6e9014a21fbc669a9c1080a4d19e1f9c4db8d930403bfd2bee93afceced90d787d0fbbbcecd870fc43be7"

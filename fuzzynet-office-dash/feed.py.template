@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""Office dashboard feed for the tvhome "Office dashboard" screensaver.
+
+Stdlib only. Serves, on DASH_BIND:DASH_PORT (default 0.0.0.0:8787):
+  GET  /feed.json        JSON feed. Needs the read token: ?token=... or header X-Dash-Token.
+  GET  /photos/<file>    Cached landscape photos (not sensitive, no token).
+  POST /calendar         Replace today's calendar. Header "Authorization: Bearer <DASH_UPLOAD_TOKEN>".
+  GET  /health           Liveness + section ages (no numbers, no token).
+
+Environment (secrets are never printed or logged):
+  STRIPE_AZTC_READ_KEY, STRIPE_FUZZHOST_READ_KEY   restricted read-only Stripe keys
+  DASH_TOKEN          read token the TV sends
+  DASH_UPLOAD_TOKEN   token for POST /calendar
+  DASH_DATA           state dir (default ~/office-dash/data)
+  DASH_MRR_SOURCE     auto (default) | subscriptions | trailing30
+  DASH_LAT/DASH_LON   weather location (decimal degrees; weather is off until both are set)
+
+Revenue definitions (USD only, other currencies ignored and counted in revenue.ignored_non_usd):
+  * A charge counts once it is status=succeeded and captured, for amount_captured.
+  * A refund counts (negative) when status is succeeded or pending, for its amount.
+  * all_time = sum(counted charges) - sum(counted refunds), both accounts.
+  * today    = charges created since local midnight (America/Phoenix) - refunds created since then.
+  * trailing_30d = same over the last 30 days.
+  * mrr      = active + past_due subscriptions (trialing excluded), each item unit_amount*quantity
+               normalized to a month (day*365/12, week*52/12, month/count, year/12/count),
+               minus percent_off coupons; amount_off coupons are subtracted once per billing period
+               (normalized). Metered/tiered prices without unit_amount count as 0.
+    DASH_MRR_SOURCE=auto shows subscription MRR when any active subscription exists, otherwise the
+    trailing 30-day net revenue with label "30 DAYS".
+State: all charge/refund ids are cached in DASH_DATA/stripe-<account>.json after one full scan; each
+poll (60s) only lists objects created in the last 3 days (30 days every 6 h) to pick up new or late
+succeeded charges and refunds.
+"""
+import datetime as dt
+import hashlib
+import json
+import os
+import random
+import re
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo("America/Phoenix")
+except Exception:  # images without tzdata; Phoenix has no DST
+    TZ = dt.timezone(dt.timedelta(hours=-7), "MST")
+
+DATA = os.path.expanduser(os.environ.get("DASH_DATA", "~/office-dash/data"))
+CONFIG_PATH = os.path.join(DATA, "config.json")
+CONFIG_KEYS = ("STRIPE_AZTC_READ_KEY", "STRIPE_FUZZHOST_READ_KEY", "DASH_TOKEN", "DASH_UPLOAD_TOKEN",
+               "DASH_MRR_SOURCE", "DASH_LAT", "DASH_LON")
+_CONFIG = {"values": {}, "mtime": None}
+
+
+def cfg(name, default=""):
+    """Setting from DATA/config.json (written by POST /provision), else the environment."""
+    try:
+        m = os.path.getmtime(CONFIG_PATH)
+        if m != _CONFIG["mtime"]:
+            _CONFIG["values"], _CONFIG["mtime"] = json.load(open(CONFIG_PATH)), m
+    except (OSError, ValueError):
+        pass
+    v = _CONFIG["values"].get(name)
+    return str(v).strip() if v not in (None, "") else os.environ.get(name, default).strip()
+PHOTOS = os.path.join(DATA, "photos")
+UA = "OfficeDashFeed/1.0 (+https://github.com/fuzzynet/umbrel-app-store)"
+ACCOUNTS = [("AZTC", "STRIPE_AZTC_READ_KEY"), ("FuzzHost", "STRIPE_FUZZHOST_READ_KEY")]
+NEW_PAYMENT_WINDOW = 30 * 60
+LOCK = threading.Lock()
+STATE = {"weather": None, "revenue": None, "new_payments": [], "photos": [], "errors": {}}
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S ") + msg, flush=True)
+
+
+def now():
+    return time.time()
+
+
+def local_midnight(ts=None):
+    d = dt.datetime.fromtimestamp(ts if ts is not None else now(), TZ)
+    return int(d.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+
+def year_start(ts=None):
+    d = dt.datetime.fromtimestamp(ts if ts is not None else now(), TZ)
+    return int(d.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+
+def key_fingerprint(key):
+    return hashlib.sha256(("office-dash:" + key).encode()).hexdigest()[:12]
+
+
+def atomic_write(path, obj, mode=None):
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode or 0o644)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f)
+    if mode:
+        os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- Stripe
+class Stripe:
+    def __init__(self, name, key):
+        self.name, self._key = name, key
+        self.path = os.path.join(DATA, "stripe-%s.json" % name.lower())
+        self.charges, self.refunds, self.meta = {}, {}, {}
+        self.ignored = 0
+        self.mrr_cents, self.active_subs = 0, 0
+        self.fp = key_fingerprint(key)
+        if os.path.exists(self.path):
+            try:
+                d = json.load(open(self.path))
+                if d.get("meta", {}).get("key_fp", self.fp) != self.fp:
+                    raise ValueError("different key")
+                self.charges, self.refunds, self.meta = d["charges"], d["refunds"], d.get("meta", {})
+                self.ignored = d.get("ignored_non_usd", 0)
+            except Exception as e:
+                log("%s: cache not usable (%s), rescanning" % (name, type(e).__name__))
+                self.charges, self.refunds, self.meta = {}, {}, {}
+        self.meta["key_fp"] = self.fp
+
+    def get(self, path, params):
+        q = urllib.parse.urlencode(params, doseq=True)
+        req = urllib.request.Request("https://api.stripe.com/v1/%s?%s" % (path, q),
+                                     headers={"Authorization": "Bearer " + self._key, "User-Agent": UA})
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return json.load(r)
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500, 502, 503) and attempt < 2:
+                    time.sleep(2 + attempt * 3)
+                    continue
+                raise RuntimeError("Stripe %s HTTP %d" % (path, e.code)) from None
+
+    def iterate(self, path, params):
+        p = dict(params, limit=100)
+        while True:
+            d = self.get(path, p)
+            yield from d["data"]
+            if not d.get("has_more") or not d["data"]:
+                return
+            p["starting_after"] = d["data"][-1]["id"]
+
+    def sync(self, since=None):
+        cp = {"created[gte]": since} if since else {}
+        changed = False
+        for c in self.iterate("charges", cp):
+            if c["id"] in self.charges:
+                continue
+            if c.get("status") == "succeeded" and c.get("captured"):
+                if c.get("currency") != "usd":
+                    self.ignored += 1
+                    self.charges[c["id"]] = {"t": c["created"], "a": 0, "x": "non-usd"}
+                    continue
+                bd = c.get("billing_details") or {}
+                self.charges[c["id"]] = {"t": c["created"], "a": int(c.get("amount_captured") or c["amount"]),
+                                         "c": short_name(bd.get("name")), "d": short_desc(c.get("description"))}
+                changed = True
+        for r in self.iterate("refunds", cp):
+            if r["id"] in self.refunds or r.get("status") not in ("succeeded", "pending"):
+                continue
+            if r.get("currency") != "usd":
+                continue
+            self.refunds[r["id"]] = {"t": r["created"], "a": int(r["amount"])}
+            changed = True
+        if since is None:
+            self.meta["full_scan"] = int(now())
+        if changed or since is None:
+            atomic_write(self.path, {"charges": self.charges, "refunds": self.refunds, "meta": self.meta,
+                                     "ignored_non_usd": self.ignored})
+
+    def sync_mrr(self):
+        total, n = 0, 0
+        for status in ("active", "past_due"):
+            for s in self.iterate("subscriptions", {"status": status, "expand[]": ["data.discounts"]}):
+                n += 1
+                total += subscription_mrr_cents(s)
+        self.mrr_cents, self.active_subs = total, n
+
+    def totals(self, t):
+        mid, d30, jan1 = local_midnight(t), t - 30 * 86400, year_start(t)
+        ch, rf = self.charges.values(), self.refunds.values()
+        return {
+            "all_time": sum(c["a"] for c in ch) - sum(r["a"] for r in rf),
+            "today": sum(c["a"] for c in ch if c["t"] >= mid) - sum(r["a"] for r in rf if r["t"] >= mid),
+            "trailing_30d": sum(c["a"] for c in ch if c["t"] >= d30) - sum(r["a"] for r in rf if r["t"] >= d30),
+            "ytd": sum(c["a"] for c in ch if c["t"] >= jan1) - sum(r["a"] for r in rf if r["t"] >= jan1),
+        }
+
+    def recent(self, t):
+        out = []
+        for cid, c in self.charges.items():
+            if c["a"] > 0 and c["t"] >= t - NEW_PAYMENT_WINDOW:
+                out.append({"id": cid, "amount_cents": c["a"], "account": self.name,
+                            "customer": c.get("c") or "", "description": c.get("d") or "", "created_epoch": c["t"]})
+        return out
+
+
+def short_name(name):
+    parts = (name or "").split()
+    if not parts:
+        return ""
+    if len(parts) >= 2:
+        return "%s %s." % (parts[0].title(), parts[-1][0].upper())
+    return parts[0][:20]
+
+
+def short_desc(desc, n=40):
+    if not desc:
+        return ""
+    d = " ".join(desc.split())
+    return d if len(d) <= n else d[: n - 1].rstrip() + "\u2026"
+
+
+def monthly_factor(interval, count):
+    count = max(1, int(count or 1))
+    return {"day": 365.0 / 12, "week": 52.0 / 12, "month": 1.0, "year": 1.0 / 12}.get(interval, 0.0) / count
+
+
+def subscription_mrr_cents(sub):
+    """Monthly recurring value of one subscription in cents (float rounded at the end)."""
+    gross = 0.0
+    factor_any = 0.0
+    for item in (sub.get("items") or {}).get("data", []):
+        price = item.get("price") or item.get("plan") or {}
+        rec = price.get("recurring") or {"interval": price.get("interval"), "interval_count": price.get("interval_count")}
+        if (price.get("currency") or "usd") != "usd":
+            continue
+        unit = price.get("unit_amount")
+        if unit is None:
+            unit = price.get("amount")
+        if unit is None:
+            continue
+        f = monthly_factor(rec.get("interval"), rec.get("interval_count"))
+        factor_any = factor_any or f
+        gross += float(unit) * int(item.get("quantity") or 1) * f
+    coupons = []
+    for d in sub.get("discounts") or []:
+        if isinstance(d, dict):
+            coupons.append((d.get("coupon") or (d.get("source") or {}).get("coupon")) or {})
+    if not coupons and isinstance(sub.get("discount"), dict):
+        coupons.append(sub["discount"].get("coupon") or {})
+    net = gross
+    for c in coupons:
+        if not isinstance(c, dict):
+            continue
+        if c.get("percent_off"):
+            net -= gross * float(c["percent_off"]) / 100.0
+        elif c.get("amount_off") and (c.get("currency") or "usd") == "usd":
+            net -= float(c["amount_off"]) * factor_any
+    return int(round(max(0.0, net)))
+
+
+def stripe_loop():
+    by_name = {}
+    last_wide, last_mrr = 0, 0
+    while True:
+        t0 = now()
+        for name, env in ACCOUNTS:  # keys can arrive or change at runtime via POST /provision
+            key = cfg(env)
+            cur = by_name.get(name)
+            if not key:
+                by_name.pop(name, None)
+            elif cur is None or cur.fp != key_fingerprint(key):
+                by_name[name] = Stripe(name, key)
+                last_mrr = 0
+        accts = [by_name[n] for n, _ in ACCOUNTS if n in by_name]
+        if not accts:
+            STATE["errors"]["stripe"] = "no Stripe keys configured"
+            time.sleep(10)
+            continue
+        try:
+            for a in accts:
+                if "full_scan" not in a.meta:
+                    log("%s: first full scan" % a.name)
+                    a.sync(None)
+                    log("%s: full scan done, %d charges, %d refunds" % (a.name, len(a.charges), len(a.refunds)))
+                elif t0 - last_wide > 6 * 3600:
+                    a.sync(int(t0 - 30 * 86400))
+                else:
+                    a.sync(int(t0 - 3 * 86400))
+            if t0 - last_wide > 6 * 3600:
+                last_wide = t0
+            if t0 - last_mrr > 15 * 60:
+                for a in accts:
+                    a.sync_mrr()
+                last_mrr = t0
+            publish_revenue(accts, t0)
+            STATE["errors"].pop("stripe", None)
+        except Exception as e:
+            import traceback
+            tb = traceback.extract_tb(e.__traceback__)[-1]
+            STATE["errors"]["stripe"] = "%s %s (line %d)" % (type(e).__name__, str(e)[:120], tb.lineno)
+            log("stripe error: " + STATE["errors"]["stripe"])
+        time.sleep(max(5, 60 - (now() - t0)))
+
+
+def publish_revenue(accts, t):
+    per = {a.name: a.totals(t) for a in accts}
+    tot = {k: sum(p[k] for p in per.values()) for k in ("all_time", "today", "trailing_30d", "ytd")}
+    subs_mrr = sum(a.mrr_cents for a in accts)
+    active = sum(a.active_subs for a in accts)
+    mode = cfg("DASH_MRR_SOURCE", "auto")
+    if mode == "subscriptions" or (mode == "auto" and active > 0):
+        middle, label = subs_mrr, "MRR"
+    else:
+        middle, label = tot["trailing_30d"], "30 DAYS"
+    rev = {"currency": "usd", "today_cents": tot["today"], "mrr_cents": middle, "mrr_label": label,
+           "subscription_mrr_cents": subs_mrr, "active_subscriptions": active,
+           "trailing_30d_cents": tot["trailing_30d"], "ytd_cents": tot["ytd"], "all_time_cents": tot["all_time"],
+           "ignored_non_usd": sum(a.ignored for a in accts),
+           "accounts": {n: {k + "_cents": v for k, v in p.items()} for n, p in per.items()},
+           "updated_epoch": int(t)}
+    recent = sorted((x for a in accts for x in a.recent(t)), key=lambda x: x["created_epoch"])[-10:]
+    with LOCK:
+        STATE["revenue"], STATE["new_payments"] = rev, recent
+
+
+# ---------------------------------------------------------------- Weather
+WMO = {0: "Clear", 1: "Mostly clear", 2: "Partly cloudy", 3: "Cloudy", 45: "Fog", 48: "Fog",
+       51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle", 56: "Freezing drizzle", 57: "Freezing drizzle",
+       61: "Light rain", 63: "Rain", 65: "Heavy rain", 66: "Freezing rain", 67: "Freezing rain",
+       71: "Light snow", 73: "Snow", 75: "Heavy snow", 77: "Snow grains", 80: "Showers", 81: "Showers",
+       82: "Heavy showers", 85: "Snow showers", 86: "Snow showers", 95: "Thunderstorms",
+       96: "Thunderstorms", 99: "Thunderstorms"}
+
+
+def weather_from_openmeteo(d):
+    cur, day = d["current"], d["daily"]
+    return {"temp_f": round(cur["temperature_2m"]), "condition": WMO.get(int(cur["weather_code"]), "—"),
+            "code": int(cur["weather_code"]), "high_f": round(day["temperature_2m_max"][0]),
+            "low_f": round(day["temperature_2m_min"][0]),
+            "precip_pct": int(day["precipitation_probability_max"][0] or 0), "updated_epoch": int(now())}
+
+
+def weather_loop():
+    while True:
+        if not (cfg("DASH_LAT") and cfg("DASH_LON")):
+            STATE["errors"]["weather"] = "no location (DASH_LAT/DASH_LON)"
+            time.sleep(30)
+            continue
+        url = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current=temperature_2m,weather_code"
+               "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+               "&temperature_unit=fahrenheit&timezone=America%%2FPhoenix&forecast_days=1"
+               % (float(cfg("DASH_LAT")), float(cfg("DASH_LON"))))
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=20) as r:
+                w = weather_from_openmeteo(json.load(r))
+            with LOCK:
+                STATE["weather"] = w
+            STATE["errors"].pop("weather", None)
+            time.sleep(15 * 60)
+        except Exception as e:
+            STATE["errors"]["weather"] = type(e).__name__
+            log("weather error: %s" % e)
+            time.sleep(120)
+
+
+# ---------------------------------------------------------------- Calendar
+def _parse_when(v):
+    """Returns (epoch or None, date or None). Accepts '2026-10-18', ISO datetimes, or Google {date|dateTime}."""
+    if isinstance(v, dict):
+        v = v.get("dateTime") or v.get("date")
+    if not v:
+        return None, None
+    v = str(v).strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+        return None, dt.date.fromisoformat(v)
+    d = dt.datetime.fromisoformat(v.replace("Z", "+00:00"))
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=TZ)
+    return int(d.timestamp()), None
+
+
+def calendar_today(raw, t=None):
+    t = now() if t is None else t
+    today = dt.datetime.fromtimestamp(t, TZ).date()
+    mid = local_midnight(t)
+    nxt = mid + 86400
+    out = []
+    for e in raw.get("events") or raw.get("items") or []:
+        if not isinstance(e, dict) or e.get("status") == "cancelled":
+            continue
+        if any(a.get("self") and a.get("responseStatus") == "declined" for a in e.get("attendees") or []
+               if isinstance(a, dict)):
+            continue
+        title = short_desc(e.get("title") or e.get("summary") or "(busy)", 48)
+        s_ep, s_d = _parse_when(e.get("start"))
+        e_ep, e_d = _parse_when(e.get("end"))
+        if s_d is not None or e.get("all_day"):
+            sd = s_d or dt.datetime.fromtimestamp(s_ep, TZ).date()
+            ed = e_d or (sd + dt.timedelta(days=1))
+            if ed <= sd:
+                ed = sd + dt.timedelta(days=1)
+            if sd <= today < ed:
+                out.append({"title": title, "all_day": True, "start_epoch": mid, "end_epoch": nxt})
+        elif s_ep is not None:
+            e_ep = e_ep or s_ep
+            if s_ep < nxt and max(e_ep, s_ep + 1) > mid:
+                out.append({"title": title, "all_day": False, "start_epoch": s_ep, "end_epoch": e_ep})
+    out.sort(key=lambda x: (not x["all_day"], x["start_epoch"], x["title"]))
+    return out
+
+
+def calendar_section():
+    p = os.path.join(DATA, "calendar.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        raw = json.load(open(p))
+        return {"date": dt.datetime.fromtimestamp(now(), TZ).date().isoformat(),
+                "events": calendar_today(raw), "updated_epoch": int(raw.get("_received_epoch", os.path.getmtime(p)))}
+    except Exception as e:
+        log("calendar unreadable: %s" % type(e).__name__)
+        return None
+
+
+# ---------------------------------------------------------------- Photos
+COMMONS = "https://commons.wikimedia.org/w/api.php"
+CATEGORIES = ["Category:Featured pictures of landscapes"]
+SKIP = re.compile(r"black (&amp;|&|and) white|monochrome|b&w|night\b", re.I)
+
+
+def clean_caption(title, meta):
+    obj = re.sub(r"<[^>]+>", "", (meta.get("ObjectName") or {}).get("value", "")).strip()
+    s = obj or title
+    s = re.sub(r"^File:", "", s)
+    s = re.sub(r"\.(jpe?g|png|tiff?)\Z", "", s, flags=re.I)
+    s = re.sub(r"[_]+", " ", s)
+    s = re.sub(r"\b(DSC|IMG|P)\s?\d+\b", "", s, flags=re.I)
+    s = re.sub(r"\b\d{4}[-.]\d{2}[-.]\d{2}\b|\b\d{8}\b|\(\d+\)|\b\d{3,}\b", "", s)
+    s = re.sub(r"\s*[-,]\s*\Z", "", re.sub(r"\s{2,}", " ", s)).strip(" -,")
+    return short_desc(s, 48) or "Wikimedia Commons"
+
+
+def commons_candidates(limit=400):
+    out = []
+    for cat in CATEGORIES:
+        p = {"action": "query", "format": "json", "generator": "categorymembers", "gcmtitle": cat,
+             "gcmtype": "file", "gcmlimit": "50", "prop": "imageinfo", "iiprop": "url|size|extmetadata|mime",
+             "iiurlwidth": "1920", "iiextmetadatafilter": "ObjectName|Artist|LicenseShortName|GPSLatitude|GPSLongitude"}
+        while len(out) < limit:
+            req = urllib.request.Request(COMMONS + "?" + urllib.parse.urlencode(p), headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                d = json.load(r)
+            for page in (d.get("query") or {}).get("pages", {}).values():
+                ii = (page.get("imageinfo") or [{}])[0]
+                w, h = ii.get("width", 0), ii.get("height", 0)
+                if ii.get("mime") != "image/jpeg" or w < 2400 or not h or not (1.45 <= w / h <= 1.85):
+                    continue
+                m = ii.get("extmetadata") or {}
+                lic = (m.get("LicenseShortName") or {}).get("value", "")
+                if not re.search(r"CC|Public domain|PD", lic, re.I) or "NC" in lic or "ND" in lic:
+                    continue
+                artist = re.sub(r"<[^>]+>", "", (m.get("Artist") or {}).get("value", "")).strip()
+                artist = artist.splitlines()[0] if artist else ""
+                if len(artist) > 40 or not artist:
+                    artist = "Wikimedia Commons"
+                if SKIP.search(page["title"] + " " + (m.get("ObjectName") or {}).get("value", "")) or SKIP.search(artist):
+                    continue
+                try:
+                    gps = (float(m["GPSLatitude"]["value"]), float(m["GPSLongitude"]["value"]))
+                except (KeyError, ValueError, TypeError):
+                    gps = None
+                out.append({"gps": gps, "title": page["title"], "thumb": ii.get("thumburl"), "page": ii.get("descriptionurl"),
+                            "caption": clean_caption(page["title"], m),
+                            "credit": short_desc("%s, %s" % (artist or "Unknown", lic), 60)})
+            if "continue" not in d:
+                break
+            p.update(d["continue"])
+    return out
+
+
+def place_from_nominatim(addr):
+    """'Isle of Skye, Scotland'-style caption from a Nominatim address dict."""
+    country = addr.get("country", "")
+    region = addr.get("state") or addr.get("region") or addr.get("province") or addr.get("archipelago") or ""
+    local = addr.get("island") or addr.get("national_park") or addr.get("county") or ""
+    if addr.get("country_code") in ("us", "gb") and region:
+        country, region = region, local
+    parts = [p for p in (region, country) if p]
+    return short_desc(", ".join(parts), 48)
+
+
+def place_name(lat, lon):
+    url = ("https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=8&accept-language=en&lat=%s&lon=%s"
+           % (lat, lon))
+    try:
+        time.sleep(1.1)  # Nominatim policy: at most 1 request per second
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=20) as r:
+            return place_from_nominatim(json.load(r).get("address") or {})
+    except Exception:
+        return ""
+
+
+def photo_loop(target=40):
+    os.makedirs(PHOTOS, exist_ok=True)
+    idx_path = os.path.join(PHOTOS, "index.json")
+    while True:
+        try:
+            idx = json.load(open(idx_path)) if os.path.exists(idx_path) else []
+            idx = [p for p in idx if os.path.exists(os.path.join(PHOTOS, p["file"]))]
+            with LOCK:
+                STATE["photos"] = idx
+            if len(idx) < target:
+                have = {p["title"] for p in idx}
+                cands = [c for c in commons_candidates() if c["title"] not in have and c["thumb"]]
+                random.shuffle(cands)
+                cands.sort(key=lambda c: c["gps"] is None)  # photos with a known place first
+                per_artist = {}
+                for p in idx:
+                    a = p["credit"].rsplit(",", 1)[0]
+                    per_artist[a] = per_artist.get(a, 0) + 1
+                picked = []
+                for c in cands:  # at most 3 photos per photographer, for variety
+                    a = c["credit"].rsplit(",", 1)[0]
+                    if per_artist.get(a, 0) < 3 and len(picked) < target - len(idx):
+                        per_artist[a] = per_artist.get(a, 0) + 1
+                        picked.append(c)
+                for c in picked:
+                    if c["gps"]:
+                        c["caption"] = place_name(*c["gps"]) or c["caption"]
+                    fn = hashlib.md5(c["title"].encode()).hexdigest()[:8] + ".jpg"
+                    req = urllib.request.Request(c["thumb"], headers={"User-Agent": UA})
+                    with urllib.request.urlopen(req, timeout=60) as r, open(os.path.join(PHOTOS, fn), "wb") as f:
+                        f.write(r.read())
+                    idx.append({"file": fn, "title": c["title"], "caption": c["caption"], "credit": c["credit"],
+                                "page": c["page"]})
+                    atomic_write(idx_path, idx)
+                    with LOCK:
+                        STATE["photos"] = list(idx)
+                    time.sleep(1)
+                log("photos: %d cached" % len(idx))
+            STATE["errors"].pop("photos", None)
+            time.sleep(24 * 3600)
+        except Exception as e:
+            STATE["errors"]["photos"] = type(e).__name__
+            log("photo error: %s" % e)
+            time.sleep(600)
+
+
+# ---------------------------------------------------------------- Provisioning
+# POST /provision lets the admin box push secrets without anyone pasting them. The body is
+#   {"payload": base64(JSON), "sig": base64(RSA PKCS#1 v1.5 SHA-256 signature of the payload bytes)}
+# and the payload is {"ts": epoch, "nonce": "...", "config": {KEY: value, ...}}. The signature must
+# verify against DASH_PROVISION_KEY ("rsa:<e>:<modulus hex>", a public key, safe to publish), ts must
+# be within 5 minutes and the nonce unused. Accepted keys are written to DATA/config.json (mode 600).
+_SHA256_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
+_NONCES = {}
+
+
+def parse_public_key(spec):
+    kind, e, n = spec.strip().split(":")
+    if kind != "rsa":
+        raise ValueError("unsupported key")
+    return int(e), int(n, 16)
+
+
+def rsa_verify(spec, message, sig):
+    e, n = parse_public_key(spec)
+    k = (n.bit_length() + 7) // 8
+    if len(sig) != k:
+        return False
+    m = pow(int.from_bytes(sig, "big"), e, n).to_bytes(k, "big")
+    digest = _SHA256_PREFIX + hashlib.sha256(message).digest()
+    expected = b"\x00\x01" + b"\xff" * (k - 3 - len(digest)) + b"\x00" + digest
+    import hmac
+    return hmac.compare_digest(m, expected)
+
+
+def apply_provision(body, t=None):
+    """Returns (http_code, response dict). Writes config.json on success."""
+    import base64
+    t = now() if t is None else t
+    spec = os.environ.get("DASH_PROVISION_KEY", "").strip()
+    if not spec:
+        return 403, {"error": "provisioning disabled (no DASH_PROVISION_KEY)"}
+    try:
+        payload = base64.b64decode(body["payload"], validate=True)
+        sig = base64.b64decode(body["sig"], validate=True)
+    except Exception:
+        return 400, {"error": "bad body"}
+    if not rsa_verify(spec, payload, sig):
+        return 401, {"error": "signature"}
+    try:
+        p = json.loads(payload)
+        ts, nonce, conf = int(p["ts"]), str(p["nonce"]), p["config"]
+    except Exception:
+        return 400, {"error": "bad payload"}
+    if abs(t - ts) > 300:
+        return 401, {"error": "stale"}
+    for k_, v in list(_NONCES.items()):
+        if v < t - 600:
+            del _NONCES[k_]
+    if nonce in _NONCES or len(nonce) < 16:
+        return 401, {"error": "replay"}
+    _NONCES[nonce] = t
+    if not isinstance(conf, dict) or set(conf) - set(CONFIG_KEYS):
+        return 400, {"error": "unknown keys", "allowed": list(CONFIG_KEYS)}
+    current = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            current = json.load(open(CONFIG_PATH))
+        except ValueError:
+            pass
+    current.update({k_: str(v) for k_, v in conf.items() if v not in (None, "")})
+    current["_provisioned_epoch"] = int(t)
+    atomic_write(CONFIG_PATH, current, mode=0o600)
+    log("provisioned: %s" % ", ".join(sorted(conf)))  # names only, never values
+    return 200, {"ok": True, "stored": sorted(conf)}
+
+
+ADMIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>Office dashboard feed</title>
+<style>body{font:15px system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;color:#222}
+td{padding:4px 12px 4px 0}code{background:#f2f2f2;padding:1px 4px}</style></head><body>
+<h2>Office dashboard feed</h2><table>%s</table>
+<p>Secrets are pushed from the admin box with <code>office-dash-provision</code> and are never shown here.
+TVs read <code>/feed.json?token=...</code>.</p></body></html>"""
+
+
+def admin_page():
+    rows = []
+    for k_ in ("STRIPE_AZTC_READ_KEY", "STRIPE_FUZZHOST_READ_KEY", "DASH_TOKEN", "DASH_UPLOAD_TOKEN"):
+        rows.append((k_, "set" if cfg(k_) else "missing"))
+    f = build_feed()
+    for k_ in ("revenue", "weather", "calendar"):
+        rows.append((k_ + " age", ("%d s" % (now() - f[k_]["updated_epoch"])) if f[k_] else "none"))
+    rows.append(("photos cached", str(len(f["photos"]))))
+    rows.append(("errors", ", ".join("%s: %s" % kv for kv in STATE["errors"].items()) or "none"))
+    pe = _CONFIG["values"].get("_provisioned_epoch")
+    rows.append(("last provisioned", dt.datetime.fromtimestamp(pe, TZ).strftime("%Y-%m-%d %H:%M %Z") if pe else "never"))
+    import html
+    return ADMIN_HTML % "".join("<tr><td>%s</td><td>%s</td></tr>" % (html.escape(a), html.escape(b)) for a, b in rows)
+
+
+# ---------------------------------------------------------------- HTTP
+def build_feed():
+    with LOCK:
+        photos = [{"url": "/photos/" + p["file"], "caption": p["caption"], "credit": p["credit"]}
+                  for p in STATE["photos"]]
+        return {"version": 1, "generated_epoch": int(now()), "timezone": "America/Phoenix",
+                "weather": STATE["weather"], "calendar": calendar_section(), "revenue": STATE["revenue"],
+                "new_payments": list(STATE["new_payments"]), "photos": photos}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "OfficeDash/1"
+
+    def log_message(self, fmt, *args):  # no query strings (tokens) in logs
+        pass
+
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store" if ctype == "application/json" else "max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _token_ok(self, env, header_value):
+        want = cfg(env)
+        import hmac
+        return bool(want) and hmac.compare_digest(want.encode(), (header_value or "").encode())
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        if u.path == "/feed.json":
+            tok = urllib.parse.parse_qs(u.query).get("token", [""])[0] or self.headers.get("X-Dash-Token", "")
+            if not self._token_ok("DASH_TOKEN", tok):
+                return self._send(401, {"error": "token"})
+            return self._send(200, build_feed())
+        if u.path.startswith("/photos/"):
+            fn = os.path.basename(u.path)
+            p = os.path.join(PHOTOS, fn)
+            if re.fullmatch(r"[0-9a-f]{8}\.jpg", fn) and os.path.exists(p):
+                return self._send(200, open(p, "rb").read(), "image/jpeg")
+            return self._send(404, {"error": "not found"})
+        if u.path in ("/", "/admin"):
+            return self._send(200, admin_page().encode(), "text/html; charset=utf-8")
+        if u.path == "/health":
+            f = build_feed()
+            ages = {k: (int(now()) - f[k]["updated_epoch"]) if f[k] else None for k in ("weather", "calendar", "revenue")}
+            return self._send(200, {"ok": True, "age_s": ages, "photos": len(f["photos"]), "errors": STATE["errors"]})
+        return self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/provision":
+            n = int(self.headers.get("Content-Length") or 0)
+            if n <= 0 or n > 64_000:
+                return self._send(400, {"error": "body size"})
+            try:
+                body = json.loads(self.rfile.read(n))
+            except ValueError:
+                return self._send(400, {"error": "bad json"})
+            return self._send(*apply_provision(body))
+        if path != "/calendar":
+            return self._send(404, {"error": "not found"})
+        auth = self.headers.get("Authorization", "")
+        if not self._token_ok("DASH_UPLOAD_TOKEN", auth[7:] if auth.startswith("Bearer ") else ""):
+            return self._send(401, {"error": "token"})
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0 or n > 1_000_000:
+            return self._send(400, {"error": "body size"})
+        try:
+            raw = json.loads(self.rfile.read(n))
+            if isinstance(raw, list):
+                raw = {"events": raw}
+            todays = calendar_today(raw)
+        except Exception as e:
+            return self._send(400, {"error": "bad json: %s" % type(e).__name__})
+        raw["_received_epoch"] = int(now())
+        atomic_write(os.path.join(DATA, "calendar.json"), raw)
+        return self._send(200, {"ok": True, "events_today": len(todays)})
+
+
+def main():
+    os.makedirs(DATA, exist_ok=True)
+    for fn in (stripe_loop, weather_loop, photo_loop):
+        threading.Thread(target=fn, daemon=True, name=fn.__name__).start()
+    bind = os.environ.get("DASH_BIND", "0.0.0.0")
+    port = int(os.environ.get("DASH_PORT", "8787"))
+    log("office-dash feed listening on %s:%d, data %s" % (bind, port, DATA))
+    ThreadingHTTPServer((bind, port), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()
