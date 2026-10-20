@@ -4,7 +4,7 @@ name: Office Dashboard Feed
 tagline: Revenue, weather, calendar and photos for a TV screensaver
 icon: https://raw.githubusercontent.com/fuzzynet/umbrel-app-store/main/fuzzynet-office-dash/icon.svg
 category: finance
-version: "1.2.0"
+version: "1.3.0"
 port: 8790
 description: >-
   A small feed for the tvhome launcher's "Office dashboard" screensaver. It serves revenue (today,
@@ -24,10 +24,11 @@ repo: https://github.com/fuzzynet/umbrel-app-store
 support: https://github.com/fuzzynet/umbrel-app-store/issues
 gallery: []
 releaseNotes: >-
-  Stripe polling is now off by default. Revenue and payment pop-ups come only from the totals an admin
-  machine pushes with POST /revenue. Stripe keys are no longer needed or provisioned (the old built-in
-  Stripe mode stays available only if DASH_STRIPE_ENABLED=1 is set). The status page no longer lists
-  Stripe keys.
+  The feed can now fetch today's calendar itself. When an admin machine provisions a private iCal
+  URL (AZTC_CALENDAR_ICS_URL, stored only in the app's data folder, mode 600), the feed pulls it every
+  15 minutes and right after midnight, expanding recurring and all-day events in Phoenix time.
+  POST /calendar pushes still work as a fallback (the newest write wins). /health now reports the
+  calendar source, age and today's event count. The URL is never logged or shown.
 dependencies: []
 path: ""
 defaultUsername: ""

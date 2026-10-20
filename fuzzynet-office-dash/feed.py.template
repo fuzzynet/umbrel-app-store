@@ -5,7 +5,8 @@ Stdlib only. Serves, on DASH_BIND:DASH_PORT (default 0.0.0.0:8787):
   GET  /feed.json        JSON feed. Needs the read token: ?token=... or header X-Dash-Token.
   GET  /photos/<file>    Cached landscape photos (not sensitive, no token).
   POST /calendar         Replace today's calendar. Header "Authorization: Bearer <DASH_UPLOAD_TOKEN>".
-  GET  /health           Liveness + section ages (no numbers, no token).
+  GET  /health           Liveness + section ages, calendar source (no numbers, no token).
+  Calendar: if AZTC_CALENDAR_ICS_URL is provisioned, the feed fetches that iCal URL every 15 min itself.
 
 Environment (secrets are never printed or logged):
   STRIPE_AZTC_READ_KEY, STRIPE_FUZZHOST_READ_KEY   restricted read-only Stripe keys (only used when
@@ -53,7 +54,8 @@ except Exception:  # images without tzdata; Phoenix has no DST
 DATA = os.path.expanduser(os.environ.get("DASH_DATA", "~/office-dash/data"))
 CONFIG_PATH = os.path.join(DATA, "config.json")
 CONFIG_KEYS = ("STRIPE_AZTC_READ_KEY", "STRIPE_FUZZHOST_READ_KEY", "DASH_TOKEN", "DASH_UPLOAD_TOKEN",
-               "DASH_MRR_SOURCE", "DASH_LAT", "DASH_LON", "DASH_STRIPE_ENABLED")
+               "DASH_MRR_SOURCE", "DASH_LAT", "DASH_LON", "DASH_STRIPE_ENABLED",
+               "AZTC_CALENDAR_ICS_URL")
 _CONFIG = {"values": {}, "mtime": None}
 
 
@@ -419,10 +421,323 @@ def calendar_section():
     try:
         raw = json.load(open(p))
         return {"date": dt.datetime.fromtimestamp(now(), TZ).date().isoformat(),
-                "events": calendar_today(raw), "updated_epoch": int(raw.get("_received_epoch", os.path.getmtime(p)))}
+                "events": calendar_today(raw), "updated_epoch": int(raw.get("_received_epoch", os.path.getmtime(p))),
+                "source": raw.get("_source", "push")}
     except Exception as e:
         log("calendar unreadable: %s" % type(e).__name__)
         return None
+
+
+# ---------------------------------------------------------------- Calendar (ICS fetch)
+# When AZTC_CALENDAR_ICS_URL is provisioned (POST /provision, stored in DATA/config.json, mode 600),
+# the feed pulls that private iCal URL itself every 15 minutes and writes today's events to
+# DATA/calendar.json in the same format the box pushes ({"events": [{title, start, end, all_day}]}).
+# POST /calendar keeps working; whichever write is newest wins. The URL is never logged or shown.
+ICS_EVERY = 15 * 60
+CAL_STATUS = {"source": None, "last_fetch_epoch": None, "events_today": None}
+_WD = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+
+
+def _ics_lines(text):
+    out = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if line[:1] in (" ", "\t") and out:
+            out[-1] += line[1:]
+        elif line:
+            out.append(line)
+    return out
+
+
+def _ics_unescape(v):
+    return re.sub(r"\\([\\;,nN])", lambda m: "\n" if m.group(1) in "nN" else m.group(1), v)
+
+
+def _ics_zone(name):
+    if not name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo as _Z
+        return _Z(name.strip('"'))
+    except Exception:
+        return TZ
+
+
+def _ics_value(params, value):
+    """Returns (datetime aware, False) or (date, True)."""
+    value = value.strip()
+    if params.get("VALUE") == "DATE" or re.fullmatch(r"\d{8}", value):
+        return dt.date(int(value[:4]), int(value[4:6]), int(value[6:8])), True
+    d = dt.datetime.strptime(value[:15], "%Y%m%dT%H%M%S")
+    if value.endswith("Z"):
+        d = d.replace(tzinfo=dt.timezone.utc)
+    else:
+        d = d.replace(tzinfo=_ics_zone(params.get("TZID")) or TZ)
+    return d, False
+
+
+def parse_ics(text):
+    events, cur = [], None
+    for line in _ics_lines(text):
+        if line == "BEGIN:VEVENT":
+            cur = {"exdate": [], "rdate": []}
+            continue
+        if line == "END:VEVENT":
+            if cur is not None and "start" in cur:
+                events.append(cur)
+            cur = None
+            continue
+        if cur is None or ":" not in line:
+            continue
+        head, value = line.split(":", 1)
+        parts = head.split(";")
+        name = parts[0].upper()
+        params = {}
+        for p in parts[1:]:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                params[k.upper()] = v
+        try:
+            if name == "SUMMARY":
+                cur["title"] = _ics_unescape(value)
+            elif name == "UID":
+                cur["uid"] = value
+            elif name == "STATUS":
+                cur["status"] = value.strip().upper()
+            elif name in ("DTSTART", "DTEND"):
+                cur["start" if name == "DTSTART" else "end"] = _ics_value(params, value)
+            elif name == "DURATION":
+                cur["duration"] = _ics_duration(value)
+            elif name == "RRULE":
+                cur["rrule"] = dict(x.split("=", 1) for x in value.split(";") if "=" in x)
+            elif name in ("EXDATE", "RDATE"):
+                for v in value.split(","):
+                    cur[name.lower()].append(_ics_value(params, v)[0])
+            elif name == "RECURRENCE-ID":
+                cur["recurrence_id"] = _ics_value(params, value)[0]
+        except (ValueError, KeyError):
+            continue
+    return events
+
+
+def _ics_duration(v):
+    m = re.fullmatch(r"([+-]?)P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?", v.strip())
+    if not m:
+        raise ValueError("duration")
+    w, d, h, mi, s = (int(x or 0) for x in m.groups()[1:])
+    td = dt.timedelta(weeks=w, days=d, hours=h, minutes=mi, seconds=s)
+    return -td if m.group(1) == "-" else td
+
+
+def _add_months(d, n):
+    y, m = divmod(d.month - 1 + n, 12)
+    return y + d.year, m + 1
+
+
+def _rrule_starts(start, rule, window_end, all_day):
+    """Occurrence starts (same type as start) from start up to window_end (a date), RFC 5545 subset:
+    FREQ DAILY/WEEKLY/MONTHLY/YEARLY, INTERVAL, COUNT, UNTIL, BYDAY (with +n/-n for monthly/yearly),
+    BYMONTHDAY, BYMONTH. Enough for Google Calendar's recurrence options."""
+    freq = rule.get("FREQ", "").upper()
+    step = max(1, int(rule.get("INTERVAL", "1") or 1))
+    count = int(rule["COUNT"]) if rule.get("COUNT") else None
+    until = None
+    if rule.get("UNTIL"):
+        until = _ics_value({}, rule["UNTIL"])[0]
+    sdate = start if all_day else start.date()
+    byday = [(int(m.group(1) or 0), _WD[m.group(2)]) for m in
+             (re.fullmatch(r"([+-]?\d+)?([A-Z]{2})", x.strip().upper()) for x in rule.get("BYDAY", "").split(",") if x.strip())
+             if m and m.group(2) in _WD]
+    bymd = [int(x) for x in rule.get("BYMONTHDAY", "").split(",") if x.strip()]
+    bymonth = [int(x) for x in rule.get("BYMONTH", "").split(",") if x.strip()]
+
+    def at(day):
+        if all_day:
+            return day
+        return dt.datetime.combine(day, start.timetz().replace(tzinfo=None)).replace(tzinfo=start.tzinfo)
+
+    def month_days(y, m):
+        first = dt.date(y, m, 1)
+        last = (dt.date(y + (m == 12), m % 12 + 1, 1) - dt.timedelta(days=1)).day
+        days = set()
+        if bymd:
+            for x in bymd:
+                if 1 <= abs(x) <= last:
+                    days.add(x if x > 0 else last + 1 + x)
+        if byday:
+            for n, wd in byday:
+                hits = [d for d in range(1, last + 1) if (first.weekday() + d - 1) % 7 == wd]
+                if n == 0:
+                    days.update(hits)
+                elif abs(n) <= len(hits):
+                    days.add(hits[n - 1] if n > 0 else hits[n])
+        if not bymd and not byday:
+            if sdate.day <= last:
+                days.add(sdate.day)
+        return [dt.date(y, m, d) for d in sorted(days)]
+
+    def periods():
+        i = 0
+        while True:
+            if freq == "DAILY":
+                yield [sdate + dt.timedelta(days=i * step)]
+            elif freq == "WEEKLY":
+                wk = sdate - dt.timedelta(days=sdate.weekday()) + dt.timedelta(weeks=i * step)
+                wds = sorted({wd for _, wd in byday}) or [sdate.weekday()]
+                yield [wk + dt.timedelta(days=w) for w in wds]
+            elif freq == "MONTHLY":
+                y, m = _add_months(sdate, i * step)
+                yield month_days(y, m)
+            elif freq == "YEARLY":
+                y = sdate.year + i * step
+                ms = bymonth or [sdate.month]
+                out = []
+                for m in ms:
+                    if byday or bymd:
+                        out += month_days(y, m)
+                    else:
+                        try:
+                            out.append(dt.date(y, m, sdate.day))
+                        except ValueError:
+                            pass
+                yield out
+            else:
+                yield [sdate] if i == 0 else None
+            i += 1
+
+    n = 0
+    for days in periods():
+        if days is None:
+            return
+        for day in days:
+            if day < sdate:
+                continue
+            if bymonth and freq != "YEARLY" and day.month not in bymonth:
+                continue
+            occ = at(day)
+            if until is not None:
+                if isinstance(until, dt.datetime) and not all_day:
+                    if occ > until:
+                        return
+                elif day > (until.date() if isinstance(until, dt.datetime) else until):
+                    return
+            n += 1
+            if count is not None and n > count:
+                return
+            yield occ
+        if days and min(days) > window_end:
+            return
+        if not days and freq in ("DAILY", "WEEKLY"):
+            return
+
+
+def _same_occurrence(a, b):
+    if isinstance(a, dt.datetime) and isinstance(b, dt.datetime):
+        return a == b
+    da = a.date() if isinstance(a, dt.datetime) else a
+    db = b.date() if isinstance(b, dt.datetime) else b
+    return da == db
+
+
+def ics_events_for_day(text, day):
+    """Today's events (Phoenix date `day`) as box-push-style dicts, recurring events expanded,
+    EXDATEs and moved/cancelled instances (RECURRENCE-ID) applied."""
+    evs = parse_ics(text)
+    overrides = {}
+    for e in evs:
+        if "recurrence_id" in e and e.get("uid"):
+            overrides.setdefault(e["uid"], []).append(e)
+    out = []
+
+    def emit(e, s, en):
+        if e.get("status") == "CANCELLED":
+            return
+        title = e.get("title") or "(busy)"
+        if isinstance(s, dt.datetime):
+            out.append({"title": title, "start": s.astimezone(TZ).isoformat(), "end": en.astimezone(TZ).isoformat()})
+        else:
+            out.append({"title": title, "start": s.isoformat(), "end": en.isoformat(), "all_day": True})
+
+    lo = day - dt.timedelta(days=1)
+    for e in evs:
+        if "recurrence_id" in e:
+            s, all_day = e["start"]
+        else:
+            s, all_day = e["start"]
+        if "end" in e:
+            length = e["end"][0] - s
+        elif "duration" in e:
+            length = e["duration"]
+        else:
+            length = dt.timedelta(days=1) if all_day else dt.timedelta(0)
+        if "recurrence_id" in e:
+            emit(e, s, s + length)
+            continue
+        starts = []
+        if "rrule" in e:
+            try:
+                for occ in _rrule_starts(s, e["rrule"], day + dt.timedelta(days=1), all_day):
+                    od = occ if all_day else occ.astimezone(TZ).date()
+                    if od >= lo - dt.timedelta(days=max(0, length.days)):
+                        starts.append(occ)
+            except Exception as ex:
+                log("calendar: recurrence skipped (%s)" % type(ex).__name__)
+                starts = [s]
+        else:
+            starts = [s]
+        for r in e["rdate"]:
+            if isinstance(r, type(s)):
+                starts.append(r)
+        ovs = overrides.get(e.get("uid"), [])
+        for occ in starts:
+            if any(_same_occurrence(occ, x) for x in e["exdate"]):
+                continue
+            if any(_same_occurrence(occ, o["recurrence_id"]) for o in ovs):
+                continue
+            emit(e, occ, occ + length)
+    # keep only what touches `day`; calendar_today() does the final cut exactly as for pushes
+    t_mid = dt.datetime.combine(day, dt.time(12), TZ).timestamp()
+    return [x for x in out if calendar_today({"events": [x]}, t_mid)]
+
+
+def ics_fetch_once(t=None):
+    url = cfg("AZTC_CALENDAR_ICS_URL")
+    if not url:
+        return None
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        text = r.read(20_000_000).decode("utf-8", "replace")
+    if "BEGIN:VCALENDAR" not in text:
+        raise RuntimeError("not an iCal file")
+    t = now() if t is None else t
+    day = dt.datetime.fromtimestamp(t, TZ).date()
+    events = ics_events_for_day(text, day)
+    atomic_write(os.path.join(DATA, "calendar.json"),
+                 {"events": events, "_received_epoch": int(t), "_source": "ics", "_date": day.isoformat()})
+    CAL_STATUS.update(source="ics", last_fetch_epoch=int(t), events_today=len(events))
+    return len(events)
+
+
+def ics_loop():
+    last_day = None
+    while True:
+        if not cfg("AZTC_CALENDAR_ICS_URL"):
+            time.sleep(60)
+            continue
+        try:
+            n = ics_fetch_once()
+            last_day = dt.datetime.fromtimestamp(now(), TZ).date()
+            STATE["errors"].pop("calendar", None)
+            log("calendar: fetched iCal, %d events today" % n)
+        except Exception as e:
+            STATE["errors"]["calendar"] = type(e).__name__
+            log("calendar fetch error: %s" % type(e).__name__)  # never the URL
+            time.sleep(120)
+            continue
+        # sleep to the next 15-minute mark, but refetch right after local midnight
+        for _ in range(ICS_EVERY // 30):
+            time.sleep(30)
+            if dt.datetime.fromtimestamp(now(), TZ).date() != last_day:
+                break
 
 
 # ---------------------------------------------------------------- Photos
@@ -638,6 +953,8 @@ def admin_page():
     f = build_feed()
     for k_ in ("revenue", "weather", "calendar"):
         rows.append((k_ + " age", ("%d s" % (now() - f[k_]["updated_epoch"])) if f[k_] else "none"))
+    rows.append(("calendar source", ((f["calendar"] or {}).get("source") or "none") +
+                 (" (iCal URL set)" if cfg("AZTC_CALENDAR_ICS_URL") else " (no iCal URL)")))
     rows.append(("photos cached", str(len(f["photos"]))))
     rows.append(("errors", ", ".join("%s: %s" % kv for kv in STATE["errors"].items()) or "none"))
     pe = _CONFIG["values"].get("_provisioned_epoch")
@@ -707,7 +1024,12 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/health":
             f = build_feed()
             ages = {k: (int(now()) - f[k]["updated_epoch"]) if f[k] else None for k in ("weather", "calendar", "revenue")}
-            return self._send(200, {"ok": True, "age_s": ages, "photos": len(f["photos"]), "errors": STATE["errors"]})
+            cal = {"source": (f["calendar"] or {}).get("source"), "age_s": ages["calendar"],
+                   "ics_configured": bool(cfg("AZTC_CALENDAR_ICS_URL")),
+                   "last_ics_fetch_epoch": CAL_STATUS["last_fetch_epoch"],
+                   "events_today": len((f["calendar"] or {}).get("events") or [])}
+            return self._send(200, {"ok": True, "age_s": ages, "photos": len(f["photos"]), "errors": STATE["errors"],
+                                    "calendar": cal})
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -754,13 +1076,14 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._send(400, {"error": "bad json: %s" % type(e).__name__})
         raw["_received_epoch"] = int(now())
+        raw["_source"] = "push"
         atomic_write(os.path.join(DATA, "calendar.json"), raw)
         return self._send(200, {"ok": True, "events_today": len(todays)})
 
 
 def main():
     os.makedirs(DATA, exist_ok=True)
-    loops = [weather_loop, photo_loop]
+    loops = [weather_loop, photo_loop, ics_loop]
     # Revenue normally arrives via POST /revenue. The built-in Stripe poller is off unless asked for.
     if cfg("DASH_STRIPE_ENABLED") == "1":
         loops.append(stripe_loop)
