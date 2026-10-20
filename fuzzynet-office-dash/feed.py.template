@@ -7,6 +7,9 @@ Stdlib only. Serves, on DASH_BIND:DASH_PORT (default 0.0.0.0:8787):
   POST /calendar         Replace today's calendar. Header "Authorization: Bearer <DASH_UPLOAD_TOKEN>".
   GET  /health           Liveness + section ages, calendar source (no numbers, no token).
   Calendar: if AZTC_CALENDAR_ICS_URL is provisioned, the feed fetches that iCal URL every 15 min itself.
+  Revenue: if WHMCS_IDENTIFIER/WHMCS_SECRET/HOME_IPV4_EXPECTED and INVOICE_NINJA_API_TOKEN are provisioned,
+  the feed computes WHMCS + Invoice Ninja revenue itself (same structure as the box collector's POST
+  /revenue). Pushes still work; the newest updated_epoch wins.
 
 Environment (secrets are never printed or logged):
   STRIPE_AZTC_READ_KEY, STRIPE_FUZZHOST_READ_KEY   restricted read-only Stripe keys (only used when
@@ -55,7 +58,8 @@ DATA = os.path.expanduser(os.environ.get("DASH_DATA", "~/office-dash/data"))
 CONFIG_PATH = os.path.join(DATA, "config.json")
 CONFIG_KEYS = ("STRIPE_AZTC_READ_KEY", "STRIPE_FUZZHOST_READ_KEY", "DASH_TOKEN", "DASH_UPLOAD_TOKEN",
                "DASH_MRR_SOURCE", "DASH_LAT", "DASH_LON", "DASH_STRIPE_ENABLED",
-               "AZTC_CALENDAR_ICS_URL")
+               "AZTC_CALENDAR_ICS_URL", "INVOICE_NINJA_API_TOKEN", "INVOICE_NINJA_URL", "WHMCS_IDENTIFIER",
+               "WHMCS_SECRET", "HOME_IPV4_EXPECTED")
 _CONFIG = {"values": {}, "mtime": None}
 
 
@@ -948,7 +952,8 @@ def admin_page():
     for k_ in ("DASH_TOKEN", "DASH_UPLOAD_TOKEN"):
         rows.append((k_, "set" if cfg(k_) else "missing"))
     pushed = revenue_push()
-    rows.append(("revenue source", "pushed (POST /revenue)" if pushed else
+    rows.append(("revenue source", ("fetched here (WHMCS + Invoice Ninja)" if (pushed or {}).get("_source") == "umbrel"
+                                    else "pushed (POST /revenue)") if pushed else
                  ("Stripe" if cfg("DASH_STRIPE_ENABLED") == "1" else "none yet")))
     f = build_feed()
     for k_ in ("revenue", "weather", "calendar"):
@@ -961,6 +966,286 @@ def admin_page():
     rows.append(("last provisioned", dt.datetime.fromtimestamp(pe, TZ).strftime("%Y-%m-%d %H:%M %Z") if pe else "never"))
     import html
     return ADMIN_HTML % "".join("<tr><td>%s</td><td>%s</td></tr>" % (html.escape(a), html.escape(b)) for a, b in rows)
+
+
+
+# ---------------------------------------------------------------- Revenue (WHMCS + Invoice Ninja fetch)
+# Port of the admin box's revenue_collector.py so the Umbrel (on the home LAN, egressing from the home IP
+# that WHMCS allowlists) computes revenue itself. Read-only calls only (WHMCS GetTransactions, Invoice
+# Ninja GET /payments). WHMCS bans the home IP after repeated failed logins, so:
+#   * nothing is sent unless the public IPv4 equals HOME_IPV4_EXPECTED;
+#   * any auth / IP / refusal answer stops WHMCS polling for good (DATA/whmcs-disabled.json) until
+#     WHMCS_IDENTIFIER or WHMCS_SECRET is provisioned again. There is no automatic retry of an auth error.
+# Credentials and customer names are never logged or published.
+WHMCS_URL = "https://fuzzhost.net/includes/api.php"
+WHMCS_UA = "FuzzHost-Assistant/1.0"
+IN_UA = "curl/8.5.0"  # invoicing.co's Cloudflare blocks the default Python user agent
+REV_WHMCS_EVERY, REV_IN_QUICK, REV_IN_FULL = 300, 120, 600
+REV_POPUP_WINDOW = 30 * 60
+WHMCS_STOP_RE = re.compile(r"authenticat|credential|invalid ip|ip address|not allowed|breaker|locked|mismatch|"
+                           r"permission|denied|access", re.I)
+GATEWAY_LABEL = {"stripe": "Card", "paypal_ppcpv": "PayPal", "paypal": "PayPal", "banktransfer": "Bank transfer",
+                 "btcpay": "Bitcoin"}
+REV_STATUS = {"whmcs": None, "invoiceninja": None, "last_publish_epoch": None}
+
+
+def _rev_load(name, default):
+    try:
+        return json.load(open(os.path.join(DATA, name)))
+    except (OSError, ValueError):
+        return default
+
+
+def _cents(x):
+    try:
+        return int(round(float(x or 0) * 100))
+    except (TypeError, ValueError):
+        return 0
+
+
+def whmcs_records(txs):
+    out = []
+    for t in txs:
+        d = str(t.get("date") or "")[:10]
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+            continue
+        gross, refund = _cents(t.get("amountin")), _cents(t.get("amountout"))
+        inv = t.get("invoiceid")
+        label = GATEWAY_LABEL.get(t.get("gateway") or "", "Payment")
+        out.append({"id": "whmcs:%s" % t.get("id"), "date": d, "net": gross - refund, "gross": gross,
+                    "desc": ("Invoice #%s · %s" % (inv, label)) if inv and str(inv) != "0" else label})
+    return out
+
+
+def in_records(payments):
+    out = []
+    for p in payments:
+        if p.get("is_deleted") or str(p.get("status_id")) not in ("4", "5", "6"):
+            continue
+        d = str(p.get("date") or "")[:10]
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+            continue
+        gross = _cents(p.get("amount"))
+        ref = (p.get("transaction_reference") or "").strip()
+        invs = [str(n) for n in (p.get("invoice_numbers") or []) if n]
+        label = "Card" if ref.startswith(("ch_", "pi_", "py_")) else "Payment"
+        out.append({"id": "in:%s" % p.get("id"), "date": d, "net": gross - _cents(p.get("refunded")), "gross": gross,
+                    "desc": ("Invoice %s · %s" % (", ".join(invs[:2]), label)) if invs else label})
+    return out
+
+
+def rev_totals(records, today):
+    d30 = (today - dt.timedelta(days=29)).isoformat()
+    jan1, td = today.replace(month=1, day=1).isoformat(), today.isoformat()
+    r = {"today_cents": 0, "trailing_30d_cents": 0, "ytd_cents": 0, "all_time_cents": 0}
+    for x in records:
+        r["all_time_cents"] += x["net"]
+        if x["date"] >= jan1:
+            r["ytd_cents"] += x["net"]
+        if x["date"] >= d30:
+            r["trailing_30d_cents"] += x["net"]
+        if x["date"] == td:
+            r["today_cents"] += x["net"]
+    return r
+
+
+class Popups:
+    """Which payments pop up on the TV, once each. The first list seen from each source is only remembered."""
+
+    def __init__(self, state):
+        self.seen = set(state.get("seen", []))
+        self.popped = state.get("popped", {})
+        self.seeded = state.get("seeded", {})
+
+    def state(self):
+        return {"seen": sorted(self.seen), "popped": self.popped, "seeded": self.seeded}
+
+    def records(self, source, account, records, t):
+        first = not self.seeded.get(source)
+        for r in records:
+            if r["id"] in self.seen:
+                continue
+            self.seen.add(r["id"])
+            if first or r["gross"] <= 0 or r["id"] in self.popped:
+                continue
+            self.popped[r["id"]] = {"t": t, "amount_cents": r["gross"], "account": account, "description": r["desc"]}
+        self.seeded[source] = True
+
+    def recent(self, t):
+        out = [{"id": pid, "amount_cents": p["amount_cents"], "account": p["account"], "customer": "",
+                "description": p["description"], "created_epoch": int(p["t"])}
+               for pid, p in self.popped.items() if t - p["t"] <= REV_POPUP_WINDOW]
+        cutoff = t - 7 * 86400
+        self.popped = {k: v for k, v in self.popped.items() if v["t"] >= cutoff}
+        return sorted(out, key=lambda x: x["created_epoch"])[-10:]
+
+
+class WhmcsError(Exception):
+    pass
+
+
+def public_ipv4():
+    for u in ("https://api.ipify.org", "https://icanhazip.com"):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": UA}), timeout=10) as r:
+                ip = r.read(64).decode().strip()
+            if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
+                return ip
+        except Exception:
+            continue
+    return None
+
+
+def fetch_whmcs():
+    ident, secret = cfg("WHMCS_IDENTIFIER"), cfg("WHMCS_SECRET")
+    tok = re.compile(r"[A-Za-z0-9_\-]+")
+    if not (tok.fullmatch(ident or "") and tok.fullmatch(secret or "")):
+        raise WhmcsError("credentials missing or malformed, not sent")
+    want = cfg("HOME_IPV4_EXPECTED")
+    if not want or public_ipv4() != want:
+        raise RuntimeError("egress is not the allowlisted home IPv4, not sent")
+    body = urllib.parse.urlencode({"identifier": ident, "secret": secret, "action": "GetTransactions",
+                                   "responsetype": "json"}).encode()
+    req = urllib.request.Request(WHMCS_URL, data=body, headers={"User-Agent": WHMCS_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            d = json.loads(e.read().decode("utf-8", "replace"))
+        except Exception:
+            raise WhmcsError("HTTP %d access refused" % e.code) if e.code in (401, 403) else e
+    if d.get("result") != "success":
+        raise WhmcsError(str(d.get("message") or "no result")[:160])
+    x = d.get("transactions") or {}
+    x = x.get("transaction", []) if isinstance(x, dict) else x
+    txs = [x] if isinstance(x, dict) else (x or [])
+    keep = ("id", "date", "gateway", "amountin", "amountout", "invoiceid", "transid")
+    return [{k: t.get(k) for k in keep} for t in txs]
+
+
+def _in_get(path):
+    base = (cfg("INVOICE_NINJA_URL") or "https://invoicing.co").rstrip("/")
+    req = urllib.request.Request(base + path, headers={"X-API-TOKEN": cfg("INVOICE_NINJA_API_TOKEN"),
+                                                       "X-Requested-With": "XMLHttpRequest",
+                                                       "Accept": "application/json", "User-Agent": IN_UA})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.load(r)
+
+
+def fetch_in(full):
+    out, page = [], 1
+    while True:
+        d = _in_get("/api/v1/payments?per_page=100&page=%d&include=invoices&sort=created_at%%7Cdesc" % page)
+        for p in d.get("data", []):
+            row = {k: p.get(k) for k in ("id", "date", "amount", "refunded", "status_id", "is_deleted",
+                                         "currency_id", "transaction_reference")}
+            row["invoice_numbers"] = [i.get("number") for i in (p.get("invoices") or [])]
+            out.append(row)
+        pg = (d.get("meta") or {}).get("pagination") or {}
+        if not full or page >= int(pg.get("total_pages") or 1):
+            return out
+        page += 1
+
+
+def compute_revenue(whmcs, inv, pop, t, whmcs_disabled=False):
+    """(revenue, new_payments) exactly as the box collector pushes them, or None until both sources loaded."""
+    w_recs = whmcs_records(whmcs["txs"]) if whmcs["fetched"] else []
+    n_recs = in_records(inv["payments"].values()) if inv["fetched"] else []
+    if whmcs["fetched"]:
+        pop.records("whmcs", "FuzzHost", w_recs, t)
+    if inv["fetched"]:
+        pop.records("invoiceninja", "AZTC", n_recs, t)
+    if not (whmcs["fetched"] and inv["fetched"]):
+        return None
+    today = dt.datetime.fromtimestamp(t, TZ).date()
+    w_t, n_t = rev_totals(w_recs, today), rev_totals(n_recs, today)
+    comb = {k: w_t[k] + n_t[k] for k in w_t}
+    rev = dict(comb, currency="usd", mrr_cents=comb["trailing_30d_cents"], mrr_label="30 DAYS",
+               source="whmcs+invoiceninja", updated_epoch=min(whmcs["fetched"], inv["fetched"]),
+               accounts={"FuzzHost (WHMCS)": w_t, "AZTC (Invoice Ninja)": n_t},
+               whmcs_polling="disabled" if whmcs_disabled else "ok")
+    return rev, pop.recent(t)
+
+
+def store_revenue(rev, pays, source):
+    """Newest wins: keep whichever revenue has the later updated_epoch; pop-ups are merged by id."""
+    with REV_WRITE_LOCK:
+        cur = revenue_push()
+        if cur and int((cur.get("revenue") or {}).get("updated_epoch") or 0) > int(rev["updated_epoch"]):
+            return False
+        t = int(now())
+        merged = {p["id"]: p for p in (cur or {}).get("new_payments", []) if t - int(p.get("created_epoch", 0)) <= REV_POPUP_WINDOW}
+        merged.update({p["id"]: p for p in pays})
+        out = sorted(merged.values(), key=lambda x: x["created_epoch"])[-10:]
+        atomic_write(os.path.join(DATA, "revenue_push.json"),
+                     {"revenue": rev, "new_payments": out, "_received_epoch": t, "_source": source})
+        return True
+
+
+REV_WRITE_LOCK = threading.Lock()
+
+
+def revenue_loop():
+    whmcs = _rev_load("whmcs.json", {"txs": [], "fetched": 0})
+    inv = _rev_load("invoiceninja.json", {"payments": {}, "fetched": 0})
+    pop = Popups(_rev_load("popups.json", {}))
+    next_whmcs, last_full, last_quick, creds = 0, 0, 0, None
+    while True:
+        t = now()
+        have_w = cfg("WHMCS_IDENTIFIER") and cfg("WHMCS_SECRET")
+        if not (have_w or cfg("INVOICE_NINJA_API_TOKEN")):
+            time.sleep(60)
+            continue
+        if cfg("INVOICE_NINJA_API_TOKEN") and t - last_quick >= REV_IN_QUICK:
+            full = t - last_full >= REV_IN_FULL
+            try:
+                got = fetch_in(full)
+                if full:
+                    inv["payments"], last_full = {str(p["id"]): p for p in got}, t
+                else:
+                    inv["payments"].update({str(p["id"]): p for p in got})
+                inv["fetched"] = int(t)
+                atomic_write(os.path.join(DATA, "invoiceninja.json"), inv, mode=0o600)
+                REV_STATUS["invoiceninja"] = "ok"
+                STATE["errors"].pop("invoiceninja", None)
+            except Exception as e:
+                REV_STATUS["invoiceninja"] = STATE["errors"]["invoiceninja"] = type(e).__name__
+                log("invoice ninja: %s" % type(e).__name__)
+            last_quick = t
+        disabled = _rev_load("whmcs-disabled.json", None)
+        cur_creds = hashlib.sha256(("%s:%s" % (cfg("WHMCS_IDENTIFIER"), cfg("WHMCS_SECRET"))).encode()).hexdigest()
+        if disabled and disabled.get("creds") != cur_creds:
+            os.remove(os.path.join(DATA, "whmcs-disabled.json"))  # re-provisioned: allow one fresh try
+            log("WHMCS re-enabled after new credentials were provisioned")
+            disabled, next_whmcs = None, 0
+        if have_w and not disabled and t >= next_whmcs:
+            try:
+                whmcs = {"txs": fetch_whmcs(), "fetched": int(t)}
+                atomic_write(os.path.join(DATA, "whmcs.json"), whmcs, mode=0o600)
+                log("whmcs: %d transactions" % len(whmcs["txs"]))
+                REV_STATUS["whmcs"] = "ok"
+                STATE["errors"].pop("whmcs", None)
+                next_whmcs = t + REV_WHMCS_EVERY
+            except WhmcsError as e:
+                msg = str(e)
+                if WHMCS_STOP_RE.search(msg) or "not sent" in msg:
+                    disabled = {"at": int(t), "reason": msg[:120], "creds": cur_creds}
+                    atomic_write(os.path.join(DATA, "whmcs-disabled.json"), disabled, mode=0o600)
+                    log("WHMCS polling STOPPED (re-provision credentials to retry): %s" % msg[:120])
+                else:
+                    log("whmcs error, retry in 15 min: %s" % msg[:120])
+                    next_whmcs = t + 900
+                REV_STATUS["whmcs"] = STATE["errors"]["whmcs"] = msg[:80]
+            except Exception as e:
+                log("whmcs error, retry in 15 min: %s" % (str(e)[:80] if "not sent" in str(e) else type(e).__name__))
+                REV_STATUS["whmcs"] = STATE["errors"]["whmcs"] = type(e).__name__
+                next_whmcs = t + 900
+        res = compute_revenue(whmcs, inv, pop, t, bool(disabled))
+        atomic_write(os.path.join(DATA, "popups.json"), pop.state(), mode=0o600)
+        if res and store_revenue(res[0], res[1], "umbrel"):
+            REV_STATUS["last_publish_epoch"] = int(t)
+        time.sleep(max(5, 60 - (now() - t)))
 
 
 # ---------------------------------------------------------------- HTTP
@@ -1028,8 +1313,15 @@ class Handler(BaseHTTPRequestHandler):
                    "ics_configured": bool(cfg("AZTC_CALENDAR_ICS_URL")),
                    "last_ics_fetch_epoch": CAL_STATUS["last_fetch_epoch"],
                    "events_today": len((f["calendar"] or {}).get("events") or [])}
+            pushed = revenue_push() or {}
+            rv = {"source": pushed.get("_source", "push" if pushed else None), "age_s": ages["revenue"],
+                  "whmcs_configured": bool(cfg("WHMCS_IDENTIFIER") and cfg("WHMCS_SECRET")),
+                  "invoiceninja_configured": bool(cfg("INVOICE_NINJA_API_TOKEN")),
+                  "whmcs": REV_STATUS["whmcs"], "invoiceninja": REV_STATUS["invoiceninja"],
+                  "whmcs_disabled": bool(_rev_load("whmcs-disabled.json", None)),
+                  "last_fetch_publish_epoch": REV_STATUS["last_publish_epoch"]}
             return self._send(200, {"ok": True, "age_s": ages, "photos": len(f["photos"]), "errors": STATE["errors"],
-                                    "calendar": cal})
+                                    "calendar": cal, "revenue": rv})
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -1065,8 +1357,8 @@ class Handler(BaseHTTPRequestHandler):
                                   "created_epoch": int(x.get("created_epoch", 0))})
             except Exception as e:
                 return self._send(400, {"error": "bad revenue: %s" % type(e).__name__})
-            atomic_write(os.path.join(DATA, "revenue_push.json"),
-                         {"revenue": rev, "new_payments": clean, "_received_epoch": int(now())})
+            if not store_revenue(rev, clean, "push"):
+                return self._send(200, {"ok": True, "ignored": "older than stored revenue"})
             return self._send(200, {"ok": True, "new_payments": len(clean)})
         try:
             raw = json.loads(self.rfile.read(n))
@@ -1083,7 +1375,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     os.makedirs(DATA, exist_ok=True)
-    loops = [weather_loop, photo_loop, ics_loop]
+    loops = [weather_loop, photo_loop, ics_loop, revenue_loop]
     # Revenue normally arrives via POST /revenue. The built-in Stripe poller is off unless asked for.
     if cfg("DASH_STRIPE_ENABLED") == "1":
         loops.append(stripe_loop)

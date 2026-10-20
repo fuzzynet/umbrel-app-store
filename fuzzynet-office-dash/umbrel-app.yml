@@ -4,7 +4,7 @@ name: Office Dashboard Feed
 tagline: Revenue, weather, calendar and photos for a TV screensaver
 icon: https://raw.githubusercontent.com/fuzzynet/umbrel-app-store/main/fuzzynet-office-dash/icon.svg
 category: finance
-version: "1.3.0"
+version: "1.4.0"
 port: 8790
 description: >-
   A small feed for the tvhome launcher's "Office dashboard" screensaver. It serves revenue (today,
@@ -24,11 +24,13 @@ repo: https://github.com/fuzzynet/umbrel-app-store
 support: https://github.com/fuzzynet/umbrel-app-store/issues
 gallery: []
 releaseNotes: >-
-  The feed can now fetch today's calendar itself. When an admin machine provisions a private iCal
-  URL (AZTC_CALENDAR_ICS_URL, stored only in the app's data folder, mode 600), the feed pulls it every
-  15 minutes and right after midnight, expanding recurring and all-day events in Phoenix time.
-  POST /calendar pushes still work as a fallback (the newest write wins). /health now reports the
-  calendar source, age and today's event count. The URL is never logged or shown.
+  The feed can now compute revenue itself. When an admin machine provisions WHMCS API credentials,
+  the expected home IPv4 and an Invoice Ninja token (stored only in the app's data folder, mode 600),
+  the feed polls WHMCS GetTransactions every 5 minutes (read-only, only when its public IP matches the
+  allowlisted home IP) and Invoice Ninja payments every 2 minutes, and produces the same TODAY / 30 DAYS /
+  YTD / ALL-TIME totals and new-payment pop-ups as the admin machine's collector. Any WHMCS
+  authentication or access error stops WHMCS polling until credentials are provisioned again.
+  POST /revenue pushes still work as a fallback; the newest data wins. /health reports the revenue source.
 dependencies: []
 path: ""
 defaultUsername: ""
