@@ -4,11 +4,11 @@ name: Office Dashboard Feed
 tagline: Revenue, weather, calendar and photos for a TV screensaver
 icon: https://raw.githubusercontent.com/fuzzynet/umbrel-app-store/main/fuzzynet-office-dash/icon.svg
 category: finance
-version: "1.4.0"
+version: "1.4.1"
 port: 8790
 description: >-
   A small feed for the tvhome launcher's "Office dashboard" screensaver. It serves revenue (today,
-  trailing 30 days or MRR, year to date and all-time) pushed by an admin machine from its billing
+  month to date or MRR, year to date and all-time) pushed by an admin machine from its billing
   systems, Open-Meteo weather, an uploaded calendar for today, and rotating Wikimedia Commons landscape photos,
   and serves them as JSON for Android TV boxes on the local network.
 
@@ -24,13 +24,10 @@ repo: https://github.com/fuzzynet/umbrel-app-store
 support: https://github.com/fuzzynet/umbrel-app-store/issues
 gallery: []
 releaseNotes: >-
-  The feed can now compute revenue itself. When an admin machine provisions WHMCS API credentials,
-  the expected home IPv4 and an Invoice Ninja token (stored only in the app's data folder, mode 600),
-  the feed polls WHMCS GetTransactions every 5 minutes (read-only, only when its public IP matches the
-  allowlisted home IP) and Invoice Ninja payments every 2 minutes, and produces the same TODAY / 30 DAYS /
-  YTD / ALL-TIME totals and new-payment pop-ups as the admin machine's collector. Any WHMCS
-  authentication or access error stops WHMCS polling until credentials are provisioned again.
-  POST /revenue pushes still work as a fallback; the newest data wins. /health reports the revenue source.
+  The middle revenue figure now matches the box collector: month-to-date from the 1st (America/Phoenix,
+  net of refunds), labeled MTD, with mtd_cents set. trailing_30d_cents is still included. The feed's own
+  Stripe fallback and its WHMCS + Invoice Ninja totals use that window. A POST /revenue value newer than
+  about 15 minutes is never replaced by those numbers.
 dependencies: []
 path: ""
 defaultUsername: ""

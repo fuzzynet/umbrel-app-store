@@ -9,7 +9,8 @@ Stdlib only. Serves, on DASH_BIND:DASH_PORT (default 0.0.0.0:8787):
   Calendar: if AZTC_CALENDAR_ICS_URL is provisioned, the feed fetches that iCal URL every 15 min itself.
   Revenue: if WHMCS_IDENTIFIER/WHMCS_SECRET/HOME_IPV4_EXPECTED and INVOICE_NINJA_API_TOKEN are provisioned,
   the feed computes WHMCS + Invoice Ninja revenue itself (same structure as the box collector's POST
-  /revenue). Pushes still work; the newest updated_epoch wins.
+  /revenue). A POST /revenue value newer than about 15 minutes is kept; after that, the newest
+  updated_epoch wins. The middle figure is month-to-date (MTD), matching the box collector.
 
 Environment (secrets are never printed or logged):
   STRIPE_AZTC_READ_KEY, STRIPE_FUZZHOST_READ_KEY   restricted read-only Stripe keys (only used when
@@ -25,13 +26,15 @@ Revenue definitions (USD only, other currencies ignored and counted in revenue.i
   * A refund counts (negative) when status is succeeded or pending, for its amount.
   * all_time = sum(counted charges) - sum(counted refunds), both accounts.
   * today    = charges created since local midnight (America/Phoenix) - refunds created since then.
-  * trailing_30d = same over the last 30 days.
+  * mtd      = same since the 1st of the current month (America/Phoenix). This is what the TV shows
+               when subscription MRR is not selected (mrr_cents, mrr_label "MTD", also mtd_cents).
+  * trailing_30d = same over the last 30 days. Still published as trailing_30d_cents; not the TV label.
   * mrr      = active + past_due subscriptions (trialing excluded), each item unit_amount*quantity
                normalized to a month (day*365/12, week*52/12, month/count, year/12/count),
                minus percent_off coupons; amount_off coupons are subtracted once per billing period
                (normalized). Metered/tiered prices without unit_amount count as 0.
-    DASH_MRR_SOURCE=auto shows subscription MRR when any active subscription exists, otherwise the
-    trailing 30-day net revenue with label "30 DAYS".
+    DASH_MRR_SOURCE=auto shows subscription MRR when any active subscription exists, otherwise
+    month-to-date net revenue with label "MTD".
 State: all charge/refund ids are cached in DASH_DATA/stripe-<account>.json after one full scan; each
 poll (60s) only lists objects created in the last 3 days (30 days every 6 h) to pick up new or late
 succeeded charges and refunds.
@@ -97,6 +100,39 @@ def local_midnight(ts=None):
 def year_start(ts=None):
     d = dt.datetime.fromtimestamp(ts if ts is not None else now(), TZ)
     return int(d.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+
+def month_start(ts=None):
+    """00:00:00 America/Phoenix on the 1st of the month containing ts."""
+    d = dt.datetime.fromtimestamp(ts if ts is not None else now(), TZ)
+    return int(d.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+
+# The TV hides revenue older than this. A POST /revenue value inside the window is left alone.
+PUSH_FRESH_S = 15 * 60
+
+
+def _revenue_stamp(cur):
+    rev = (cur or {}).get("revenue") or {}
+    for raw in (cur.get("_received_epoch"), rev.get("updated_epoch")):
+        try:
+            stamp = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if stamp > 0:
+            return stamp
+    return 0
+
+
+def push_is_fresh(t, cur):
+    """True when cur is a box-collector push newer than about 15 minutes.
+
+    In-app numbers (Stripe fallback, WHMCS + Invoice Ninja) must not replace it.
+    """
+    if not cur or cur.get("_source") not in (None, "push"):
+        return False
+    stamp = _revenue_stamp(cur)
+    return stamp > 0 and (int(t) - stamp) <= PUSH_FRESH_S
 
 
 def key_fingerprint(key):
@@ -194,11 +230,12 @@ class Stripe:
         self.mrr_cents, self.active_subs = total, n
 
     def totals(self, t):
-        mid, d30, jan1 = local_midnight(t), t - 30 * 86400, year_start(t)
+        mid, d30, jan1, m0 = local_midnight(t), t - 30 * 86400, year_start(t), month_start(t)
         ch, rf = self.charges.values(), self.refunds.values()
         return {
             "all_time": sum(c["a"] for c in ch) - sum(r["a"] for r in rf),
             "today": sum(c["a"] for c in ch if c["t"] >= mid) - sum(r["a"] for r in rf if r["t"] >= mid),
+            "mtd": sum(c["a"] for c in ch if m0 <= c["t"] <= t) - sum(r["a"] for r in rf if m0 <= r["t"] <= t),
             "trailing_30d": sum(c["a"] for c in ch if c["t"] >= d30) - sum(r["a"] for r in rf if r["t"] >= d30),
             "ytd": sum(c["a"] for c in ch if c["t"] >= jan1) - sum(r["a"] for r in rf if r["t"] >= jan1),
         }
@@ -313,21 +350,26 @@ def stripe_loop():
 
 def publish_revenue(accts, t):
     per = {a.name: a.totals(t) for a in accts}
-    tot = {k: sum(p[k] for p in per.values()) for k in ("all_time", "today", "trailing_30d", "ytd")}
+    tot = {k: sum(p[k] for p in per.values()) for k in ("all_time", "today", "mtd", "trailing_30d", "ytd")}
     subs_mrr = sum(a.mrr_cents for a in accts)
     active = sum(a.active_subs for a in accts)
     mode = cfg("DASH_MRR_SOURCE", "auto")
     if mode == "subscriptions" or (mode == "auto" and active > 0):
         middle, label = subs_mrr, "MRR"
     else:
-        middle, label = tot["trailing_30d"], "30 DAYS"
+        # Box collector pushes this window as "MTD". trailing_30d_cents stays on the payload.
+        middle, label = tot["mtd"], "MTD"
     rev = {"currency": "usd", "today_cents": tot["today"], "mrr_cents": middle, "mrr_label": label,
            "subscription_mrr_cents": subs_mrr, "active_subscriptions": active,
-           "trailing_30d_cents": tot["trailing_30d"], "ytd_cents": tot["ytd"], "all_time_cents": tot["all_time"],
+           "mtd_cents": tot["mtd"], "trailing_30d_cents": tot["trailing_30d"],
+           "ytd_cents": tot["ytd"], "all_time_cents": tot["all_time"],
            "ignored_non_usd": sum(a.ignored for a in accts),
            "accounts": {n: {k + "_cents": v for k, v in p.items()} for n, p in per.items()},
            "updated_epoch": int(t)}
     recent = sorted((x for a in accts for x in a.recent(t)), key=lambda x: x["created_epoch"])[-10:]
+    # Never replace a box-collector push that the TV would still show (~15 minutes).
+    if push_is_fresh(t, revenue_push()):
+        return
     with LOCK:
         STATE["revenue"], STATE["new_payments"] = rev, recent
 
@@ -951,10 +993,8 @@ def admin_page():
     rows = []
     for k_ in ("DASH_TOKEN", "DASH_UPLOAD_TOKEN"):
         rows.append((k_, "set" if cfg(k_) else "missing"))
-    pushed = revenue_push()
-    rows.append(("revenue source", ("fetched here (WHMCS + Invoice Ninja)" if (pushed or {}).get("_source") == "umbrel"
-                                    else "pushed (POST /revenue)") if pushed else
-                 ("Stripe" if cfg("DASH_STRIPE_ENABLED") == "1" else "none yet")))
+    _rev, _pays, src = revenue_view()
+    rows.append(("revenue source", revenue_source_label(src)))
     f = build_feed()
     for k_ in ("revenue", "weather", "calendar"):
         rows.append((k_ + " age", ("%d s" % (now() - f[k_]["updated_epoch"])) if f[k_] else "none"))
@@ -1037,13 +1077,16 @@ def in_records(payments):
 def rev_totals(records, today):
     d30 = (today - dt.timedelta(days=29)).isoformat()
     jan1, td = today.replace(month=1, day=1).isoformat(), today.isoformat()
-    r = {"today_cents": 0, "trailing_30d_cents": 0, "ytd_cents": 0, "all_time_cents": 0}
+    month1 = today.replace(day=1).isoformat()
+    r = {"today_cents": 0, "mtd_cents": 0, "trailing_30d_cents": 0, "ytd_cents": 0, "all_time_cents": 0}
     for x in records:
         r["all_time_cents"] += x["net"]
         if x["date"] >= jan1:
             r["ytd_cents"] += x["net"]
         if x["date"] >= d30:
             r["trailing_30d_cents"] += x["net"]
+        if month1 <= x["date"] <= td:
+            r["mtd_cents"] += x["net"]
         if x["date"] == td:
             r["today_cents"] += x["net"]
     return r
@@ -1161,7 +1204,7 @@ def compute_revenue(whmcs, inv, pop, t, whmcs_disabled=False):
     today = dt.datetime.fromtimestamp(t, TZ).date()
     w_t, n_t = rev_totals(w_recs, today), rev_totals(n_recs, today)
     comb = {k: w_t[k] + n_t[k] for k in w_t}
-    rev = dict(comb, currency="usd", mrr_cents=comb["trailing_30d_cents"], mrr_label="30 DAYS",
+    rev = dict(comb, currency="usd", mrr_cents=comb["mtd_cents"], mrr_label="MTD",
                source="whmcs+invoiceninja", updated_epoch=min(whmcs["fetched"], inv["fetched"]),
                accounts={"FuzzHost (WHMCS)": w_t, "AZTC (Invoice Ninja)": n_t},
                whmcs_polling="disabled" if whmcs_disabled else "ok")
@@ -1169,12 +1212,18 @@ def compute_revenue(whmcs, inv, pop, t, whmcs_disabled=False):
 
 
 def store_revenue(rev, pays, source):
-    """Newest wins: keep whichever revenue has the later updated_epoch; pop-ups are merged by id."""
+    """Keep a POST /revenue value newer than about 15 minutes.
+
+    Otherwise the later updated_epoch wins. Pop-ups are merged by id. This feed's own
+    numbers (source other than "push") must not replace that fresh push.
+    """
     with REV_WRITE_LOCK:
         cur = revenue_push()
+        t = int(now())
+        if source != "push" and push_is_fresh(t, cur):
+            return False
         if cur and int((cur.get("revenue") or {}).get("updated_epoch") or 0) > int(rev["updated_epoch"]):
             return False
-        t = int(now())
         merged = {p["id"]: p for p in (cur or {}).get("new_payments", []) if t - int(p.get("created_epoch", 0)) <= REV_POPUP_WINDOW}
         merged.update({p["id"]: p for p in pays})
         out = sorted(merged.values(), key=lambda x: x["created_epoch"])[-10:]
@@ -1251,23 +1300,54 @@ def revenue_loop():
 # ---------------------------------------------------------------- HTTP
 def revenue_push():
     """Revenue pushed by the box collector (POST /revenue): WHMCS + Invoice Ninja totals and pop-ups.
-    Once a push has been received it replaces this feed's own Stripe numbers and Stripe pop-ups."""
+    A push newer than about 15 minutes replaces this feed's own Stripe numbers. After that, Stripe
+    may publish again; this file is still not rewritten by the Stripe fallback."""
     p = os.path.join(DATA, "revenue_push.json")
     try:
-        return json.load(open(p))
+        with open(p) as fh:
+            return json.load(fh)
     except (OSError, ValueError):
         return None
 
 
-def build_feed():
+def revenue_source_label(src):
+    if src == "umbrel":
+        return "fetched here (WHMCS + Invoice Ninja)"
+    if src == "push":
+        return "pushed (POST /revenue)"
+    if src == "stripe":
+        return "Stripe"
+    return "Stripe" if cfg("DASH_STRIPE_ENABLED") == "1" else "none yet"
+
+
+def revenue_view(t=None):
+    """(revenue, new_payments, source) actually served.
+
+    A POST /revenue value newer than about 15 minutes always wins over this feed's own
+    Stripe numbers. A stale push gives way once Stripe has published. An in-app WHMCS
+    file (source "umbrel") is served as stored.
+    """
+    t = now() if t is None else t
     pushed = revenue_push()
+    with LOCK:
+        own, pays = STATE["revenue"], list(STATE["new_payments"])
+    if pushed and push_is_fresh(t, pushed):
+        return pushed.get("revenue"), list(pushed.get("new_payments") or []), "push"
+    if own is not None and (not pushed or pushed.get("_source") in (None, "push")):
+        return own, pays, "stripe"
+    if pushed:
+        return pushed.get("revenue"), list(pushed.get("new_payments") or []), pushed.get("_source") or "push"
+    return None, [], None
+
+
+def build_feed():
+    revenue, pays, _src = revenue_view()
     with LOCK:
         photos = [{"url": "/photos/" + p["file"], "caption": p["caption"], "credit": p["credit"]}
                   for p in STATE["photos"]]
         return {"version": 1, "generated_epoch": int(now()), "timezone": "America/Phoenix",
                 "weather": STATE["weather"], "calendar": calendar_section(),
-                "revenue": pushed["revenue"] if pushed else STATE["revenue"],
-                "new_payments": list(pushed["new_payments"] if pushed else STATE["new_payments"]), "photos": photos}
+                "revenue": revenue, "new_payments": pays, "photos": photos}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1313,8 +1393,8 @@ class Handler(BaseHTTPRequestHandler):
                    "ics_configured": bool(cfg("AZTC_CALENDAR_ICS_URL")),
                    "last_ics_fetch_epoch": CAL_STATUS["last_fetch_epoch"],
                    "events_today": len((f["calendar"] or {}).get("events") or [])}
-            pushed = revenue_push() or {}
-            rv = {"source": pushed.get("_source", "push" if pushed else None), "age_s": ages["revenue"],
+            _rev, _pays, src = revenue_view()
+            rv = {"source": src, "age_s": ages["revenue"],
                   "whmcs_configured": bool(cfg("WHMCS_IDENTIFIER") and cfg("WHMCS_SECRET")),
                   "invoiceninja_configured": bool(cfg("INVOICE_NINJA_API_TOKEN")),
                   "whmcs": REV_STATUS["whmcs"], "invoiceninja": REV_STATUS["invoiceninja"],
