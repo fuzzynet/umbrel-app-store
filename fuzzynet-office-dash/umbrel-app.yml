@@ -4,7 +4,7 @@ name: Office Dashboard Feed
 tagline: Revenue, weather, calendar and photos for a TV screensaver
 icon: https://raw.githubusercontent.com/fuzzynet/umbrel-app-store/main/fuzzynet-office-dash/icon.svg
 category: finance
-version: "1.4.0"
+version: "1.5.0"
 port: 8790
 description: >-
   A small feed for the tvhome launcher's "Office dashboard" screensaver. It serves revenue (today,
@@ -24,13 +24,10 @@ repo: https://github.com/fuzzynet/umbrel-app-store
 support: https://github.com/fuzzynet/umbrel-app-store/issues
 gallery: []
 releaseNotes: >-
-  The feed can now compute revenue itself. When an admin machine provisions WHMCS API credentials,
-  the expected home IPv4 and an Invoice Ninja token (stored only in the app's data folder, mode 600),
-  the feed polls WHMCS GetTransactions every 5 minutes (read-only, only when its public IP matches the
-  allowlisted home IP) and Invoice Ninja payments every 2 minutes, and produces the same TODAY / 30 DAYS /
-  YTD / ALL-TIME totals and new-payment pop-ups as the admin machine's collector. Any WHMCS
-  authentication or access error stops WHMCS polling until credentials are provisioned again.
-  POST /revenue pushes still work as a fallback; the newest data wins. /health reports the revenue source.
+  The revenue total the feed computes itself (WHMCS every 5 minutes, Invoice Ninja every 2 minutes) now
+  matches the admin machine's collector: the middle figure is month to date, labeled MTD, instead of the
+  trailing 30 days. Totals still include today, year to date and all time, and new-payment pop-ups are
+  unchanged. With this version the admin machine's collector can be switched off.
 dependencies: []
 path: ""
 defaultUsername: ""

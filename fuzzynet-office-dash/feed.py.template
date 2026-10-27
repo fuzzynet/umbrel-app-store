@@ -1037,9 +1037,12 @@ def in_records(payments):
 def rev_totals(records, today):
     d30 = (today - dt.timedelta(days=29)).isoformat()
     jan1, td = today.replace(month=1, day=1).isoformat(), today.isoformat()
-    r = {"today_cents": 0, "trailing_30d_cents": 0, "ytd_cents": 0, "all_time_cents": 0}
+    m1 = today.replace(day=1).isoformat()  # month to date (America/Phoenix)
+    r = {"today_cents": 0, "trailing_30d_cents": 0, "mtd_cents": 0, "ytd_cents": 0, "all_time_cents": 0}
     for x in records:
         r["all_time_cents"] += x["net"]
+        if x["date"] >= m1:
+            r["mtd_cents"] += x["net"]
         if x["date"] >= jan1:
             r["ytd_cents"] += x["net"]
         if x["date"] >= d30:
@@ -1161,7 +1164,7 @@ def compute_revenue(whmcs, inv, pop, t, whmcs_disabled=False):
     today = dt.datetime.fromtimestamp(t, TZ).date()
     w_t, n_t = rev_totals(w_recs, today), rev_totals(n_recs, today)
     comb = {k: w_t[k] + n_t[k] for k in w_t}
-    rev = dict(comb, currency="usd", mrr_cents=comb["trailing_30d_cents"], mrr_label="30 DAYS",
+    rev = dict(comb, currency="usd", mrr_cents=comb["mtd_cents"], mrr_label="MTD",
                source="whmcs+invoiceninja", updated_epoch=min(whmcs["fetched"], inv["fetched"]),
                accounts={"FuzzHost (WHMCS)": w_t, "AZTC (Invoice Ninja)": n_t},
                whmcs_polling="disabled" if whmcs_disabled else "ok")
