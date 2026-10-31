@@ -4,7 +4,7 @@ name: Office Dashboard Feed
 tagline: Revenue, weather, calendar and photos for a TV screensaver
 icon: https://raw.githubusercontent.com/fuzzynet/umbrel-app-store/main/fuzzynet-office-dash/icon.svg
 category: finance
-version: "1.4.1"
+version: "1.4.2"
 port: 8790
 description: >-
   A small feed for the tvhome launcher's "Office dashboard" screensaver. It serves revenue (today,
@@ -24,10 +24,9 @@ repo: https://github.com/fuzzynet/umbrel-app-store
 support: https://github.com/fuzzynet/umbrel-app-store/issues
 gallery: []
 releaseNotes: >-
-  The middle revenue figure now matches the box collector: month-to-date from the 1st (America/Phoenix,
-  net of refunds), labeled MTD, with mtd_cents set. trailing_30d_cents is still included. The feed's own
-  Stripe fallback and its WHMCS + Invoice Ninja totals use that window. A POST /revenue value newer than
-  about 15 minutes is never replaced by those numbers.
+  WHMCS revenue calls go to the tailnet host (fuzzhost-whmcs.tailnet-bf56.ts.net) instead of the public
+  fuzzhost.net API, which is being closed. The feed container pins that hostname to its tailnet address
+  so it resolves without MagicDNS.
 dependencies: []
 path: ""
 defaultUsername: ""
