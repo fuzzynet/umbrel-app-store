@@ -1017,7 +1017,9 @@ def admin_page():
 #   * any auth / IP / refusal answer stops WHMCS polling for good (DATA/whmcs-disabled.json) until
 #     WHMCS_IDENTIFIER or WHMCS_SECRET is provisioned again. There is no automatic retry of an auth error.
 # Credentials and customer names are never logged or published.
-WHMCS_URL = "https://fuzzhost.net/includes/api.php"
+# The public fuzzhost.net API is being closed. Call WHMCS on the tailnet host.
+# The feed service pins this name in docker-compose extra_hosts (containers cannot resolve MagicDNS).
+WHMCS_URL = "https://fuzzhost-whmcs.tailnet-bf56.ts.net/includes/api.php"
 WHMCS_UA = "FuzzHost-Assistant/1.0"
 IN_UA = "curl/8.5.0"  # invoicing.co's Cloudflare blocks the default Python user agent
 REV_WHMCS_EVERY, REV_IN_QUICK, REV_IN_FULL = 300, 120, 600

@@ -17,6 +17,10 @@ services:
     user: "1000:1000"
     init: true
     restart: on-failure
+    # Umbrel containers cannot resolve Tailscale MagicDNS. Pin the WHMCS host to its
+    # tailnet address (the same mapping as the live deployment).
+    extra_hosts:
+      - "fuzzhost-whmcs.tailnet-bf56.ts.net:100.120.162.107"
     command: ["python", "-u", "/app/feed.py"]
     volumes:
       - ${APP_DATA_DIR}/feed.py:/app/feed.py:ro
